@@ -65,7 +65,21 @@ def strays(ps, known):
     return out
 
 # ------------------------------------------------------------- transcripts ---
+_TFCACHE = {}
+
 def transcript_for(worktree, started, rid=None):
+    """Cached: the glob and stat of every session file is pure overhead once the
+    match is known, and it ran for all 25 runs on every refresh."""
+    key = (worktree, rid)
+    hit = _TFCACHE.get(key)
+    if hit is not None and (hit is False or hit.exists()):
+        return None if hit is False else hit
+    val = _transcript_for(worktree, started, rid)
+    if len(_TFCACHE) > 128: _TFCACHE.clear()
+    _TFCACHE[key] = val if val else False
+    return val
+
+def _transcript_for(worktree, started, rid=None):
     """Claude writes a live transcript per session under ~/.claude/projects,
     regardless of the launcher's output format. Runs started by agentrun-launch
     also write our own stream, which is an exact match rather than a guess —
@@ -612,23 +626,29 @@ def detail(run, ev, mtime, scroll, W, H, reply):
             human = val[2] if len(val) > 2 else val[1]
             feed.append("  " + dim(f"· {human}"[: W - 4]))
     # The conversation gets its own reserved block at the bottom instead of
-    # replacing the screen, so you can watch the agent while you wait on it.
-    convo = []
+    # replacing the screen. A long answer scrolls in place with the arrows.
+    convo, reply_lines, reply_room = [], [], 0
     if reply:
         convo.append(" " + dim("\u2500" * min(W - 2, 74)))
         convo.append(" " + cyan("you \u203a ") + reply["q"][:W - 8])
         if reply.get("pending"):
             convo.append(" " + dim("agent \u2039 waiting, this can take a minute"))
         else:
-            body = (reply.get("a") or "(no reply)").splitlines()
-            flat = []
-            for para in body:
-                flat += wrap(para, W - 10) if para.strip() else [""]
-            shown = flat[:8]
-            for j, ln in enumerate(shown):
-                convo.append(" " + (cyan("agent \u2039 ") if j == 0 else "        ") + ln)
-            if len(flat) > len(shown):
-                convo.append(" " + dim("        ... %d more lines" % (len(flat) - len(shown))))
+            for para in (reply.get("a") or "(no reply)").splitlines():
+                reply_lines += wrap(para, W - 10) if para.strip() else [""]
+            reply_room = max(3, min(len(reply_lines), (H - len(L)) // 2))
+            off = max(0, min(reply.get("scroll", 0), len(reply_lines) - reply_room))
+            reply["scroll"] = off
+            window = reply_lines[off:off + reply_room]
+            for j, ln in enumerate(window):
+                convo.append(" " + (cyan("agent \u2039 ") if j == 0 and off == 0
+                                    else "        ") + ln)
+            below = len(reply_lines) - off - reply_room
+            if below > 0 or off > 0:
+                bits = []
+                if off > 0:    bits.append(f"{off} above")
+                if below > 0:  bits.append(f"{below} below")
+                convo.append(" " + dim("        \u2191\u2193 " + ", ".join(bits)))
 
     # A run a few seconds old has almost nothing in the feed. Show what it is
     # meant to do and what it has touched, rather than a screen of blank rows.
@@ -646,7 +666,10 @@ def detail(run, ev, mtime, scroll, W, H, reply):
     L += feed[start:start + room] if room > 0 else []
     while len(L) < H - 1 - len(convo): L.append("")
     L += convo
-    tail = "  ↑↓ scroll · ← back · m message · q quit"
+    if reply and not reply.get("pending"):
+        tail = "  ↑↓ scroll answer · esc close · ← back · m message · q quit"
+    else:
+        tail = "  ↑↓ scroll · ← back · m message · q quit"
     if scroll: tail += f"   (scrolled back {scroll})"
     L.append(dim(tail))
     return L
@@ -682,7 +705,9 @@ def main():
                 with lock: shared["runs"] = fresh
             except Exception:
                 pass
-            stop.wait(2.0)
+            # Idle boxes do not need polling at working speed.
+            busy = any(r.get("running") for r in shared.get("runs", []))
+            stop.wait(2.0 if busy else 8.0)
     threading.Thread(target=refresher, daemon=True).start()
     try:
         while True:
@@ -707,9 +732,18 @@ def main():
                 elif k in ("enter", "right") and vis:
                     view, scroll, reply = "detail", 0, None
             else:
-                if   k in ("left", "esc", "back"): view, scroll, reply = "list", 0, None
-                elif k == "up":    scroll += 3
-                elif k == "down":  scroll = max(0, scroll - 3)
+                if   k in ("left", "back"): view, scroll, reply = "list", 0, None
+                elif k == "esc":
+                    if reply: reply = None      # close the answer, keep the run open
+                    else:     view, scroll = "list", 0
+                elif k == "up":
+                    if reply and not reply.get("pending"):
+                        reply["scroll"] = reply.get("scroll", 0) + 3
+                    else: scroll += 3
+                elif k == "down":
+                    if reply and not reply.get("pending"):
+                        reply["scroll"] = max(0, reply.get("scroll", 0) - 3)
+                    else: scroll = max(0, scroll - 3)
                 elif k == "m":
                     run = vis[min(sel, len(vis) - 1)] if vis else None
                     live = bool(run and run["running"] and run.get("fifo"))
