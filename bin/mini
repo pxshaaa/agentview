@@ -5,9 +5,13 @@
 #   mini              the dashboard: ↑↓ move · ↵ open · ← back · m message · q quit
 #   mini once         one plain snapshot (scripts, scrollback)
 #   mini show <id>    that run's report + uncommitted diffstat, as plain text
+# These are documented config, and they are set on the client while the code
+# runs on the remote host. ssh does not carry env across, so pass it explicitly.
+ENVFWD="AGENT_IGNORE='${AGENT_IGNORE:-}' AGENTRUN_STALL='${AGENTRUN_STALL:-}'"
+
 case "${1:-}" in
-  once|status) ssh "$AGENT_HOST" "~/bin/agentrun-tui --once" ;;
-  all)         ssh "$AGENT_HOST" "~/bin/agentrun-tui --once --all" ;;
+  once|status) ssh "$AGENT_HOST" "$ENVFWD ~/bin/agentrun-tui --once" ;;
+  all)         ssh "$AGENT_HOST" "$ENVFWD ~/bin/agentrun-tui --once --all" ;;
   show)
     ID="$2"; [ -z "$ID" ] && { echo "usage: mini show <id>"; exit 1; }
     ssh "$AGENT_HOST" "
@@ -32,6 +36,6 @@ print(json.loads(p.read_text()).get('worktree','') if p.exists() else '')\")
         git -C \"\$W\" diff --stat | tail -25
       fi" ;;
   -h|--help)   sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//' ;;
-  "")          ssh -t "$AGENT_HOST" "~/bin/agentrun-tui" ;;
+  "")          ssh -t "$AGENT_HOST" "$ENVFWD ~/bin/agentrun-tui" ;;
   *)           echo "usage: mini [once|all|show <id>]"; exit 1 ;;
 esac

@@ -14,7 +14,7 @@ from pathlib import Path
 
 REG   = Path.home() / ".agentrun"
 PROJ  = Path.home() / ".claude" / "projects"
-STALL = int(os.environ.get("AGENTRUN_STALL", "600"))
+STALL = int(os.environ.get("AGENTRUN_STALL") or 600)
 
 E = "\033["
 # In --once mode the output is often piped; raw escapes there are noise.
@@ -66,7 +66,7 @@ def strays(ps, known):
 
 # ------------------------------------------------------------- transcripts ---
 def transcript_for(worktree, started, rid=None):
-    """Claude Code writes a live transcript per session under ~/.claude/projects,
+    """Claude writes a live transcript per session under ~/.claude/projects,
     regardless of the launcher's output format. Runs started by agentrun-launch
     also write our own stream, which is an exact match rather than a guess —
     prefer it, and fall back to the project transcript for everything else."""
@@ -188,14 +188,32 @@ def adopt(pid, rid, args):
             "brief": str(brief), "adopted": True}, indent=2))
     except Exception: pass
 
+def summary_for(rid):
+    """The SUMMARY: line an agent ends its report with. Read from the small
+    report file rather than re-parsing a multi-megabyte transcript."""
+    for cand in (REG / f"{rid}.report", Path(f"/tmp/{rid}.log")):
+        if not cand.exists() or not cand.stat().st_size: continue
+        try: txt = cand.read_text("utf-8", "replace")
+        except Exception: continue
+        for line in reversed(txt.splitlines()):
+            t = line.strip().lstrip("*# ").strip()
+            if t.upper().startswith("SUMMARY:"):
+                return " ".join(t.split(":", 1)[1].split())
+    return None
+
 def wt_dirty(worktree):
+    """int = uncommitted files (minus AGENT_IGNORE matches), "gone" = worktree
+    vanished, None = not a repo. Gone must never look the same as clean."""
     if not worktree: return None
     if not Path(worktree).is_dir(): return "gone"
     try:
         r = subprocess.run(["git", "-C", worktree, "status", "--porcelain"],
                            capture_output=True, text=True, timeout=10)
         if r.returncode != 0: return None
-        return len([l for l in r.stdout.splitlines() if l.strip()])
+        files = [l[3:].strip().strip('"') for l in r.stdout.splitlines() if l.strip()]
+        ig = os.environ.get("AGENT_IGNORE") or None
+        if ig: files = [f for f in files if ig not in f]
+        return len(files)
     except Exception:
         return "gone"
 
@@ -346,7 +364,8 @@ def overview(runs, sel, show_all, cal, W):
         else:              mark, tone = "✓", dim
         meta  = "/".join(v for v in (r.get("model"), r.get("effort")) if v)
         where = r.get("wt_name") or "?"
-        if r.get("branch"): where += " → " + r["branch"]
+        if r.get("branch") and r["branch"] != r.get("wt_name"):
+            where += " → " + r["branch"]
         row = (f" {tone(mark)} {bold(r['id']):<12}"
                f"{hms(now - r.get('started', now)):>6} · {meta:<12} {dim(where)}")
         L.append(inv(f"{E}0m" + row) if i == sel else row)
@@ -376,6 +395,10 @@ def overview(runs, sel, show_all, cal, W):
             elif isinstance(r["dirty"], int) and r["dirty"]:
                 L.append("   " + yellow(f"{r['dirty']} file"
                                         f"{'s' if r['dirty'] != 1 else ''} UNCOMMITTED"))
+            sm = summary_for(r["id"])
+            if sm:
+                for j, ln in enumerate(wrap(sm, W - 8)[:3]):
+                    L.append("   " + (dim("SUMMARY: ") if j == 0 else "         ") + dim(ln))
         L.append("")
     if hidden and not show_all:
         L.append(" " + dim(f"{hidden} finished and harvested · a to show"))
