@@ -243,6 +243,18 @@ def collect():
         if r.get("fifo") and not Path(r["fifo"]).exists(): r["fifo"] = None
         runs.append(r)
     runs.sort(key=lambda r: (0 if r["running"] else 1, -r.get("started", 0)))
+    # Several runs often reuse one worktree. Its uncommitted files belong to
+    # whichever touched it last; repeating them under three runs reads as 30.
+    claimed = {}
+    for r in runs:
+        wt = r.get("worktree")
+        r["shared_with"] = None
+        if wt and isinstance(r["dirty"], int) and r["dirty"]:
+            if wt in claimed:
+                r["shared_with"] = claimed[wt]
+                r["dirty"] = 0
+            else:
+                claimed[wt] = r["id"]
     return runs
 
 def calibration():
@@ -344,7 +356,7 @@ def send_message(run, text):
         return f"(failed: {e})"
 
 # ------------------------------------------------------------------ views ---
-def overview(runs, sel, show_all, cal, W):
+def overview(runs, sel, show_all, cal, W, H=0):
     live = sum(1 for r in runs if r["running"])
     rev  = sum(1 for r in runs if not r["running"]
                and isinstance(r["dirty"], int) and r["dirty"])
@@ -354,7 +366,7 @@ def overview(runs, sel, show_all, cal, W):
     L = ["", " " + bold(head), " " + dim("─" * min(W - 2, 74))]
     now, hidden = time.time(), 0
     for i, r in enumerate(runs):
-        idle = (not r["running"]
+        idle = (not r["running"] and not r.get("shared_with")
                 and (r["dirty"] in (0, None) or r["dirty"] == "gone"))
         if idle and not show_all:
             hidden += 1; continue
@@ -395,6 +407,9 @@ def overview(runs, sel, show_all, cal, W):
         else:
             if r["dirty"] == "gone":
                 L.append("   " + dim("worktree removed — cannot verify what was harvested"))
+            elif r.get("shared_with"):
+                L.append("   " + dim(f"shares worktree with {r['shared_with']}, "
+                                     f"which holds the uncommitted work"))
             elif isinstance(r["dirty"], int) and r["dirty"]:
                 L.append("   " + yellow(f"{r['dirty']} file"
                                         f"{'s' if r['dirty'] != 1 else ''} UNCOMMITTED"))
@@ -405,6 +420,9 @@ def overview(runs, sel, show_all, cal, W):
         L.append("")
     if hidden and not show_all:
         L.append(" " + dim(f"{hidden} finished and harvested · a to show"))
+    if H:
+        while len(L) < H - 1: L.append("")
+        L.append(dim("  ↑↓ move · ↵ open · m message · a all · q quit"))
     return L
 
 def detail(run, ev, mtime, scroll, W, H, reply):
@@ -473,7 +491,8 @@ def main():
                 runs, last = collect(), time.time()
                 sel = min(sel, max(0, len(runs) - 1))
             if view == "list":
-                scr.paint(overview(runs, sel, show_all, calibration(), scr.cols))
+                scr.paint(overview(runs, sel, show_all, calibration(),
+                                   scr.cols, scr.rows))
             else:
                 run = runs[sel]
                 ev, mtime = read_transcript(run["tpath"])
