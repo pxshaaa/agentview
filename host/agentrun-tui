@@ -254,9 +254,27 @@ def summary_for(rid):
                 return " ".join(t.split(":", 1)[1].split())
     return None
 
+_GIT_TTL = 8.0
+_gitcache = {}
+
+def _cached(key, ttl, fn):
+    """git status costs ~36ms and several runs share one worktree, so without
+    this the refresh cost scales with runs rather than with worktrees."""
+    now = time.time()
+    hit = _gitcache.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    if len(_gitcache) > 128: _gitcache.clear()
+    _gitcache[key] = (now, val)
+    return val
+
 def wt_files(worktree, limit=12):
     """Which files the agent has actually touched, newest first. A young run has
     almost no events, so this is often the only concrete thing to show."""
+    return _cached(("files", worktree), 5.0, lambda: _wt_files(worktree, limit))
+
+def _wt_files(worktree, limit=12):
     if not worktree or not Path(worktree).is_dir(): return []
     try:
         r = subprocess.run(["git", "-C", worktree, "status", "--porcelain"],
@@ -296,6 +314,9 @@ def brief_task(path, lines=10):
 def wt_dirty(worktree):
     """int = uncommitted files (minus AGENT_IGNORE matches), "gone" = worktree
     vanished, None = not a repo. Gone must never look the same as clean."""
+    return _cached(("dirty", worktree), _GIT_TTL, lambda: _wt_dirty(worktree))
+
+def _wt_dirty(worktree):
     if not worktree: return None
     if not Path(worktree).is_dir(): return "gone"
     try:
@@ -432,13 +453,20 @@ def send_live(run, text):
     already in flight."""
     fifo = run.get("fifo")
     if not (fifo and Path(fifo).exists()): return None
+    # Framed as an aside. Without this an agent tends to treat an incoming
+    # message as a new instruction and abandon what it was doing; one under test
+    # stopped mid-task to argue about a note instead of finishing.
+    framed = ("[Note from the orchestrator, sent while you work. Read it, and "
+              "carry on with your current task unless it genuinely changes what "
+              "you should do. If it does not apply, ignore it and keep going.]\n\n"
+              + text)
     try:
         fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps({"type": "user", "message": {"role": "user",
-                    "content": [{"type": "text", "text": text}]}}) + "\n")
-        return ("delivered to the live agent — it will pick this up at its next "
-                "turn. Watch the feed above for its response.")
+                    "content": [{"type": "text", "text": framed}]}}) + "\n")
+        return ("delivered as a side note. The agent picks it up at its next "
+                "turn and keeps working; it is not an interrupt.")
     except Exception as e:
         return f"(could not reach the live agent: {e})"
 
@@ -568,9 +596,11 @@ def detail(run, ev, mtime, scroll, W, H, reply):
     if run.get("worktree"): L.append(" " + dim(run["worktree"]))
     if run.get("sid"): L.append(" " + dim("session " + run["sid"]))
     if run["running"]:
-        L.append(" " + (green("live input open — m sends a real message")
+        L.append(" " + (green("live channel open · m sends a side note, delivered "
+                              "at its next turn")
                         if run.get("fifo") and Path(run["fifo"]).exists()
-                        else dim("no live channel — m asks a forked copy instead")))
+                        else dim("no live channel · m asks a forked copy, the running "
+                                 "agent is not disturbed")))
     L.append(" " + dim("─" * min(W - 2, 74)))
 
     feed = []
@@ -641,12 +671,24 @@ def main():
     ORIGINAL = termios.tcgetattr(fd)
     scr = Screen(); scr.enter(); tty.setraw(fd)
     sel, show_all, view, scroll, reply = 0, False, "list", 0, None
-    runs, last = collect(), 0.0
+    runs = collect()
+    # Refresh off the draw loop. Collecting costs a burst of git calls, and doing
+    # it inline froze the interface for a fraction of a second every few seconds.
+    shared, lock, stop = {"runs": runs}, threading.Lock(), threading.Event()
+    def refresher():
+        while not stop.is_set():
+            try:
+                fresh = collect()
+                with lock: shared["runs"] = fresh
+            except Exception:
+                pass
+            stop.wait(2.0)
+    threading.Thread(target=refresher, daemon=True).start()
     try:
         while True:
-            if time.time() - last > 2.0:
-                runs, last = collect(), time.time()
-                sel = min(sel, max(0, len(runs) - 1))
+            with lock:
+                runs = shared["runs"]
+            sel = min(sel, max(0, len(visible_runs(runs, show_all)) - 1))
             if view == "list":
                 scr.paint(overview(runs, sel, show_all, calibration(),
                                    scr.cols, scr.rows))
@@ -671,7 +713,8 @@ def main():
                 elif k == "m":
                     run = vis[min(sel, len(vis) - 1)] if vis else None
                     live = bool(run and run["running"] and run.get("fifo"))
-                    txt = prompt(scr, "message \u203a " if live else "ask (forked copy) \u203a ")
+                    txt = prompt(scr, "side note \u203a " if live
+                                 else "ask a copy \u203a ")
                     if txt and run:
                         reply = {"q": txt, "a": None, "pending": True}
                         # Answering can take a minute. Do it off the draw loop so
@@ -685,6 +728,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        stop.set()
         termios.tcsetattr(fd, termios.TCSADRAIN, ORIGINAL)
         scr.leave()
 
