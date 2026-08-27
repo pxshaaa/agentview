@@ -9,7 +9,7 @@ Reads Claude's own session transcripts, so every run is visible whether or not
 it was launched through mini-run. Never kills, commits or pushes; the only
 writes are run metadata under ~/.agentrun and messages you deliberately send.
 """
-import json, os, re, select, subprocess, sys, termios, time, tty
+import json, os, re, select, subprocess, sys, termios, threading, time, tty
 from pathlib import Path
 
 REG   = Path(os.environ.get("AGENTRUN_DIR") or (Path.home() / ".agentrun"))
@@ -138,10 +138,63 @@ def read_transcript(path, tail_bytes=900_000):
                        or inp.get("command") or inp.get("description") or "")
                 tgt = " ".join(str(tgt).split())
                 if len(tgt) > 70: tgt = tgt[:69] + "…"
-                ev.append(("tool", (b.get("name") or "?", tgt), ts))
+                nm = b.get("name") or "?"
+                ev.append(("tool", (nm, tgt, describe(nm, inp)), ts))
     if len(_TCACHE) > 64: _TCACHE.clear()
     _TCACHE[key] = ((st.st_size, st.st_mtime), ev)
     return ev, st.st_mtime
+
+def _base(x):
+    x = str(x).strip().strip("\"'")
+    return x.rsplit("/", 1)[-1] or x
+
+def describe(name, inp):
+    """Turn a tool call into something a person can skim. The raw command is
+    noise; what matters is what the agent was trying to find out or change."""
+    inp = inp or {}
+    if name == "Read":   return "read " + _base(inp.get("file_path", ""))
+    if name == "Write":  return "wrote " + _base(inp.get("file_path", ""))
+    if name in ("Edit", "NotebookEdit"):
+        return "edited " + _base(inp.get("file_path", ""))
+    if name == "Grep":
+        where = " in " + _base(inp.get("path")) if inp.get("path") else ""
+        return "searched for " + str(inp.get("pattern", ""))[:40] + where
+    if name == "Glob":      return "listed files matching " + str(inp.get("pattern", ""))
+    if name == "TodoWrite": return "updated its plan"
+    if name == "Task":      return "delegated a subtask"
+    if name in ("WebFetch", "WebSearch"):
+        return "looked up " + str(inp.get("url") or inp.get("query", ""))[:50]
+    if name != "Bash":
+        return name.lower()
+
+    c = " ".join(str(inp.get("command", "")).split())
+    low = c.lower()
+    if re.search(r"\b(pytest|jest|go test|cargo test|npm test|-m unittest)\b", low):
+        return "ran tests"
+    if low.startswith("git diff"):   return "checked the diff"
+    if low.startswith("git status"): return "checked git status"
+    if low.startswith("git log"):    return "checked the history"
+    if low.startswith("git show"):   return "read a committed version"
+    if low.startswith(("grep", "rg ")) or "| grep" in low:
+        m = re.search(r"(?:grep|rg)\s+(?:-\S+\s+)*[\"']?([^\"'|;>]{1,40})", c)
+        return "searched for " + m.group(1).strip() if m else "searched the codebase"
+    if low.startswith("sed -n"):
+        m = re.search(r"sed -n\s+(\d+),(\d+)p\s+(\S+)", c)
+        if m: return "read lines %s–%s of %s" % (m.group(1), m.group(2), _base(m.group(3)))
+        return "read part of a file"
+    if low.startswith(("cat ", "head ", "tail ")):
+        # `cat > file <<EOF` writes a file; only `cat file` reads one.
+        m = re.search(r"^\w+\s+(?:-\S+\s+)*([^\s>|]+)", c)
+        if re.match(r"^\w+\s*>", c):
+            w = re.search(r">\s*(\S+)", c)
+            return "wrote " + _base(w.group(1)) if w else "wrote a file"
+        return "read " + _base(m.group(1)) if m else "read a file"
+    if low.startswith(("ls", "find ", "tree")):     return "listed files"
+    if low.startswith(("python3", "python", "node ", "npx ")): return "ran a script"
+    if low.startswith("docker"):                    return "ran a container"
+    if low.startswith(("mkdir", "cp ", "mv ")):     return "moved files around"
+    if low.startswith(("echo", "printf")):          return "wrote some text"
+    return "ran " + _base((c.split() or ["?"])[0])
 
 PHASE = {"Read": "reading", "Grep": "searching", "Glob": "searching",
          "Edit": "editing", "Write": "writing", "NotebookEdit": "editing",
@@ -464,7 +517,8 @@ def overview(runs, sel, show_all, cal, W, H=0):
                 ph  = PHASE.get(tool[0], tool[0])
                 age = hms(now - mtime) if mtime else "?"
                 room = max(20, W - 22)
-                left = f"   ▸ {ph}  {tool[1]}"
+                what = tool[2] if len(tool) > 2 else tool[1]
+                left = f"   ▸ {what}"
                 if len(left) > room: left = left[: room - 1] + "…"
                 L.append(g + f"{left:<{room}}  " + dim(f"{age} ago"))
             if say:
@@ -525,13 +579,26 @@ def detail(run, ev, mtime, scroll, W, H, reply):
             feed += ["  " + ln for ln in wrap(val, W - 4)]
             feed.append("")
         else:
-            feed.append("  " + dim(f"· {PHASE.get(val[0], val[0])}  {val[1]}"[: W - 4]))
+            human = val[2] if len(val) > 2 else val[1]
+            feed.append("  " + dim(f"· {human}"[: W - 4]))
+    # The conversation gets its own reserved block at the bottom instead of
+    # replacing the screen, so you can watch the agent while you wait on it.
+    convo = []
     if reply:
-        feed += ["", "  " + cyan("── your message ──")]
-        feed += ["  " + ln for ln in wrap(reply[0], W - 4)]
-        feed += ["", "  " + cyan("── reply ──")]
-        for para in reply[1].splitlines():
-            feed += ["  " + ln for ln in wrap(para, W - 4)] if para.strip() else [""]
+        convo.append(" " + dim("\u2500" * min(W - 2, 74)))
+        convo.append(" " + cyan("you \u203a ") + reply["q"][:W - 8])
+        if reply.get("pending"):
+            convo.append(" " + dim("agent \u2039 waiting, this can take a minute"))
+        else:
+            body = (reply.get("a") or "(no reply)").splitlines()
+            flat = []
+            for para in body:
+                flat += wrap(para, W - 10) if para.strip() else [""]
+            shown = flat[:8]
+            for j, ln in enumerate(shown):
+                convo.append(" " + (cyan("agent \u2039 ") if j == 0 else "        ") + ln)
+            if len(flat) > len(shown):
+                convo.append(" " + dim("        ... %d more lines" % (len(flat) - len(shown))))
 
     # A run a few seconds old has almost nothing in the feed. Show what it is
     # meant to do and what it has touched, rather than a screen of blank rows.
@@ -544,10 +611,11 @@ def detail(run, ev, mtime, scroll, W, H, reply):
         feed += ["", "  " + cyan("── files touched ──")]
         feed += [f"  {dim(code):<4} {name}" for _, code, name in files]
 
-    room = H - len(L) - 2
+    room = H - len(L) - 2 - len(convo)
     start = max(0, len(feed) - room - scroll)
     L += feed[start:start + room] if room > 0 else []
-    while len(L) < H - 1: L.append("")
+    while len(L) < H - 1 - len(convo): L.append("")
+    L += convo
     tail = "  ↑↓ scroll · ← back · m message · q quit"
     if scroll: tail += f"   (scrolled back {scroll})"
     L.append(dim(tail))
@@ -601,13 +669,18 @@ def main():
                 elif k == "up":    scroll += 3
                 elif k == "down":  scroll = max(0, scroll - 3)
                 elif k == "m":
-                    run = vis[sel]
-                    live = run["running"] and run.get("fifo")
-                    txt = prompt(scr, "message → " if live else "ask (forked copy) → ")
-                    if txt:
-                        scr.paint(["", "  " + dim("sending…" if live else "asking the agent…")])
-                        r = send_live(run, txt) if live else None
-                        reply = (txt, r if r is not None else send_message(run, txt))
+                    run = vis[min(sel, len(vis) - 1)] if vis else None
+                    live = bool(run and run["running"] and run.get("fifo"))
+                    txt = prompt(scr, "message \u203a " if live else "ask (forked copy) \u203a ")
+                    if txt and run:
+                        reply = {"q": txt, "a": None, "pending": True}
+                        # Answering can take a minute. Do it off the draw loop so
+                        # the feed keeps updating instead of the screen freezing.
+                        def _ask(box=reply, r=run, t=txt, was_live=live):
+                            out = send_live(r, t) if was_live else None
+                            box["a"] = out if out is not None else send_message(r, t)
+                            box["pending"] = False
+                        threading.Thread(target=_ask, daemon=True).start()
                         scroll = 0
     except KeyboardInterrupt:
         pass
