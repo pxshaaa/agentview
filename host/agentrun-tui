@@ -145,7 +145,7 @@ def read_transcript(path, tail_bytes=900_000):
         ts = d.get("timestamp")
         for b in d.get("message", {}).get("content", []):
             if b.get("type") == "text" and b.get("text", "").strip():
-                ev.append(("say", " ".join(b["text"].split()), ts))
+                ev.append(("say", b["text"].rstrip(), ts))
             elif b.get("type") == "tool_use":
                 inp = b.get("input") or {}
                 tgt = (inp.get("file_path") or inp.get("path") or inp.get("pattern")
@@ -157,6 +157,40 @@ def read_transcript(path, tail_bytes=900_000):
     if len(_TCACHE) > 64: _TCACHE.clear()
     _TCACHE[key] = ((st.st_size, st.st_mtime), ev)
     return ev, st.st_mtime
+
+FENCE = re.compile(r"```.*?```", re.S)
+LINKS = re.compile(r"\[([^\]]{1,60})\]\([^)]+\)")
+
+def strip_md(text):
+    """Agents write reports in markdown. On a terminal the syntax is noise, and
+    a fenced diff or a table turns the panel into a wall. Keep the sentences."""
+    t = FENCE.sub(" (code) ", str(text))
+    out = []
+    for ln in t.splitlines():
+        st = ln.strip()
+        if not st:
+            out.append("")
+            continue
+        if st.startswith("|") or set(st) <= set("|-: "):
+            if out and out[-1] == "(table)": continue
+            out.append("(table)"); continue
+        st = LINKS.sub(r"\1", st)
+        h = re.match(r"^#{1,6}\s*(.+)$", st)
+        if h:
+            out.append("── " + h.group(1).replace("**", "").replace("`", ""))
+            continue
+        st = re.sub(r"^[-*+]\s+", "· ", st)
+        st = st.replace("**", "").replace("__", "").replace("`", "")
+        out.append(st)
+    return [l for l in out]
+
+def digest(paragraph, width, cap):
+    """First `cap` wrapped lines of a block, plus how much was left."""
+    flat = []
+    for ln in strip_md(paragraph):
+        flat += wrap(ln, width) if ln.strip() else [""]
+    flat = [l for l in flat if l.strip()]
+    return flat[:cap], max(0, len(flat) - cap)
 
 def _base(x):
     x = str(x).strip().strip("\"'")
@@ -554,6 +588,7 @@ def overview(runs, sel, show_all, cal, W, H=0):
             L.append(g + " " + ln)
         if r["running"]:
             say  = next((v for k, v, _ in reversed(ev) if k == "say"), None)
+            if say: say = " ".join(str(say).split())
             tool = next((v for k, v, _ in reversed(ev) if k == "tool"), None)
             if tool:
                 ph  = PHASE.get(tool[0], tool[0])
@@ -592,7 +627,7 @@ def overview(runs, sel, show_all, cal, W, H=0):
         L.append(dim("  ↑↓ move · ↵ open · m message · a all · q quit"))
     return L
 
-def detail(run, ev, mtime, scroll, W, H, reply):
+def detail(run, ev, mtime, scroll, W, H, reply, full=False):
     now = time.time()
     state = green("running") if run["running"] else dim("finished")
     L = ["", " " + bold(run["id"]) + "  " + state
@@ -617,14 +652,28 @@ def detail(run, ev, mtime, scroll, W, H, reply):
                                  "agent is not disturbed")))
     L.append(" " + dim("─" * min(W - 2, 74)))
 
-    feed = []
-    for kind, val, _ in ev:
-        if kind == "say":
-            feed += ["  " + ln for ln in wrap(val, W - 4)]
-            feed.append("")
-        else:
+    # Digest by default. An agent's final report is markdown, often hundreds of
+    # lines, and dumping it raw makes the panel unreadable. `f` shows everything.
+    feed, i, cap = [], 0, (9999 if full else 3)
+    while i < len(ev):
+        kind, val, _ = ev[i]
+        if kind == "tool":
             human = val[2] if len(val) > 2 else val[1]
-            feed.append("  " + dim(f"· {human}"[: W - 4]))
+            n = 1
+            while (i + n < len(ev) and ev[i + n][0] == "tool"
+                   and (ev[i + n][1][2] if len(ev[i + n][1]) > 2 else "") == human):
+                n += 1
+            label = human + (f"  ×{n}" if n > 1 else "")
+            feed.append("  " + dim(("· " + label)[: W - 4]))
+            i += n
+            continue
+        shown, rest = digest(val, W - 6, cap)
+        for ln in shown:
+            feed.append("  " + ln)
+        if rest:
+            feed.append("  " + dim(f"  … {rest} more lines · f to expand"))
+        feed.append("")
+        i += 1
     # The conversation gets its own reserved block at the bottom instead of
     # replacing the screen. A long answer scrolls in place with the arrows.
     convo, reply_lines, reply_room = [], [], 0
@@ -669,7 +718,8 @@ def detail(run, ev, mtime, scroll, W, H, reply):
     if reply and not reply.get("pending"):
         tail = "  ↑↓ scroll answer · esc close · ← back · m message · q quit"
     else:
-        tail = "  ↑↓ scroll · ← back · m message · q quit"
+        tail = ("  ↑↓ scroll · f " + ("digest" if full else "full text")
+                + " · ← back · m message · q quit")
     if scroll: tail += f"   (scrolled back {scroll})"
     L.append(dim(tail))
     return L
@@ -694,6 +744,7 @@ def main():
     ORIGINAL = termios.tcgetattr(fd)
     scr = Screen(); scr.enter(); tty.setraw(fd)
     sel, show_all, view, scroll, reply = 0, False, "list", 0, None
+    full = False
     runs = collect()
     # Refresh off the draw loop. Collecting costs a burst of git calls, and doing
     # it inline froze the interface for a fraction of a second every few seconds.
@@ -720,7 +771,7 @@ def main():
             else:
                 run = vis[sel]
                 ev, mtime = read_transcript(run["tpath"])
-                scr.paint(detail(run, ev, mtime, scroll, scr.cols, scr.rows, reply))
+                scr.paint(detail(run, ev, mtime, scroll, scr.cols, scr.rows, reply, full))
             k = read_key(1.0)
             if k is None: continue
             if k == "q": break
@@ -744,6 +795,8 @@ def main():
                     if reply and not reply.get("pending"):
                         reply["scroll"] = max(0, reply.get("scroll", 0) - 3)
                     else: scroll = max(0, scroll - 3)
+                elif k == "f":
+                    full = not full; scroll = 0
                 elif k == "m":
                     run = vis[min(sel, len(vis) - 1)] if vis else None
                     live = bool(run and run["running"] and run.get("fifo"))
