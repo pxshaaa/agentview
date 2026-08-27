@@ -1,19 +1,37 @@
 # agentview
 
-A terminal dashboard for headless Claude Code agents running on another machine.
+Run your Claude Code agents on a remote machine, and watch all of them from one
+terminal dashboard.
 
-I run long `claude -p` jobs on a Mac mini over ssh, often four or five at once.
-The problem is that they're completely opaque while they work. `--output-format
-text` buffers everything, so a 50 minute agent is a zero byte log file until it
-finishes. You can't tell a working agent from a hung one, you can't see what
-it's doing, and when it's done you have to go find its output yourself.
+## Why
 
-This shows all of them on one screen, live, and lets you talk to them.
+Two problems show up the moment you start using headless agents seriously.
+
+**Your own machine becomes unusable.** Spawning several `claude -p` agents
+locally means several Claude Code processes, several test runs and several dev
+servers, all fighting for CPU with whatever you were actually trying to do. So I
+moved them onto a separate box over ssh. A cheap VPS, a spare Mac mini, an old
+desktop, anything works. My laptop stays free while the agents grind.
+
+**Then you can't see them any more.** Once they run somewhere else, and
+especially once four or five run at once, keeping track becomes the new problem.
+One Claude Code window per agent does not scale, and headless runs are worse than
+that: `--output-format text` buffers everything, so a 50 minute agent is a zero
+byte log file until the moment it finishes. You cannot tell a working agent from
+a hung one, you cannot see what it is doing, and when it is done you have to go
+and dig out its output yourself.
+
+The last one is what actually costs time. More than once I have had an agent
+finish real work and leave it uncommitted in a worktree while I moved on to
+something else, and only found it when I went looking for something unrelated.
+
+agentview puts every agent on one screen, live, shows you which ones finished
+with work you never collected, and lets you send them a message while they run.
 
 ```
 AGENTS · 2 running · 1 needs review
 
- ● run121   29m · opus/high    task-b → feature/dropdown
+ ● run121   29m · opus/high    task-b
    Does the onboarding conflict card actually fire?
    ▸ running  npx jest src/components/__tests__       5s ago
      "Now proving the tests were red before the fix."
@@ -123,11 +141,10 @@ The dashboard tells you which mode you're in before you type.
 
 ## Why not just tail the logs
 
-Because there's nothing to tail. Text output buffers until the run ends. You can
-switch to `--output-format stream-json` and tail that, which is roughly where
-this started, but you still end up wanting one screen instead of five tmux panes,
-and you still can't answer "which of these finished with work I never collected",
-which turns out to be the question that costs real time.
+There is nothing to tail. Text output buffers until the run ends. You can switch
+to `--output-format stream-json` and tail that, which is roughly where this
+started, but five tmux panes of raw JSON is not an improvement, and it still
+cannot tell you which runs finished with work you never collected.
 
 ## Safety
 
