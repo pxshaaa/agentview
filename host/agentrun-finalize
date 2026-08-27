@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""Run once when an agent exits: extract its final report and stamp the
+registry. Read-only with respect to the repos — touches only ~/.agentrun."""
+import json, sys, time
+from pathlib import Path
+REG = Path.home() / ".agentrun"
+rid = sys.argv[1]
+reg, js = REG / f"{rid}.json", REG / f"{rid}.jsonl"
+final, err = None, None
+if js.exists():
+    for line in js.read_text("utf-8", "replace").splitlines():
+        if '"result"' not in line: continue
+        try: d = json.loads(line)
+        except Exception: continue
+        if d.get("type") == "result":
+            final = d.get("result")
+            err = d.get("is_error") or d.get("api_error_status")
+            meta = {k: d.get(k) for k in
+                    ("duration_ms", "num_turns", "total_cost_usd", "stop_reason")}
+            break
+    else:
+        meta = {}
+else:
+    meta = {}
+if final:
+    (REG / f"{rid}.report").write_text(str(final))
+if reg.exists():
+    try:
+        r = json.loads(reg.read_text())
+        r.update({"ended": time.time(), "pid": None, "is_error": bool(err), **meta})
+        reg.write_text(json.dumps(r, indent=2))
+    except Exception:
+        pass

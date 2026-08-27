@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""Interactive overview of the agent runs on this machine.
+
+  ↑ ↓        move          ↵ or →   open a run
+  ← or esc   back           m       message the agent
+  a          show harvested runs    q  quit
+
+Reads Claude's own session transcripts, so every run is visible whether or not
+it was launched through mini-run. Never kills, commits or pushes; the only
+writes are run metadata under ~/.agentrun and messages you deliberately send.
+"""
+import json, os, re, select, subprocess, sys, termios, time, tty
+from pathlib import Path
+
+REG   = Path.home() / ".agentrun"
+PROJ  = Path.home() / ".claude" / "projects"
+STALL = int(os.environ.get("AGENTRUN_STALL", "600"))
+
+E = "\033["
+# In --once mode the output is often piped; raw escapes there are noise.
+_COLOR = not os.environ.get("NO_COLOR")
+def sgr(s, c): return f"{E}{c}m{s}{E}0m" if _COLOR else s
+dim    = lambda s: sgr(s, "2")
+bold   = lambda s: sgr(s, "1")
+green  = lambda s: sgr(s, "32")
+yellow = lambda s: sgr(s, "33")
+cyan   = lambda s: sgr(s, "36")
+inv    = lambda s: sgr(s, "7")
+
+def hms(sec):
+    sec = int(sec or 0)
+    if sec < 60:   return f"{sec}s"
+    if sec < 3600: return f"{sec//60}m"
+    return f"{sec//3600}h{(sec%3600)//60:02d}"
+
+def visible_len(s): return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+# ---------------------------------------------------------------- process ---
+def ps_snapshot():
+    out = {}
+    try:
+        r = subprocess.run(["ps", "-o", "pid=,args=", "-ax"],
+                           capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            pid, _, args = line.strip().partition(" ")
+            if pid.isdigit(): out[int(pid)] = args.strip()
+    except Exception:
+        pass
+    return out
+
+def alive(pid, rid, ps):
+    """A PID alone is not proof — the OS reuses them. Require the run id too."""
+    try: pid = int(pid)
+    except (TypeError, ValueError): return False
+    return rid in ps.get(pid, "")
+
+def strays(ps, known):
+    out = []
+    for pid, args in ps.items():
+        if "claude -p" not in args: continue
+        if not args.startswith(("sh -c", "/bin/sh -c")): continue
+        m = re.search(r"/tmp/([A-Za-z0-9_.-]+)\.brief", args)
+        if m and m.group(1) in known: continue
+        out.append((pid, m.group(1) if m else None, args))
+    return out
+
+# ------------------------------------------------------------- transcripts ---
+def transcript_for(worktree, started, rid=None):
+    """Claude Code writes a live transcript per session under ~/.claude/projects,
+    regardless of the launcher's output format. Runs started by agentrun-launch
+    also write our own stream, which is an exact match rather than a guess —
+    prefer it, and fall back to the project transcript for everything else."""
+    if rid:
+        own = REG / f"{rid}.jsonl"
+        if own.exists() and own.stat().st_size: return own
+    if not worktree: return None
+    # /tmp is a symlink to /private/tmp on macOS; the slug uses the real path.
+    try: worktree = str(Path(worktree).resolve())
+    except Exception: pass
+    d = PROJ / worktree.replace("/", "-").replace(".", "-")
+    if not d.is_dir(): return None
+    best, best_gap = None, None
+    for f in d.glob("*.jsonl"):
+        try: st = f.stat()
+        except OSError: continue
+        if st.st_mtime < (started or 0) - 60: continue   # ended before we began
+        gap = abs(st.st_ctime - (started or st.st_ctime))
+        if best_gap is None or gap < best_gap:
+            best, best_gap = f, gap
+    return best
+
+def session_id_in(path):
+    """Our own stream carries the session id in its events rather than its name."""
+    try:
+        with path.open("r", errors="replace") as f:
+            for _ in range(60):
+                line = f.readline()
+                if not line: break
+                if '"session_id"' not in line: continue
+                try: d = json.loads(line)
+                except Exception: continue
+                if d.get("session_id"): return d["session_id"]
+    except Exception:
+        pass
+    return None
+
+_TCACHE = {}
+
+def read_transcript(path, tail_bytes=900_000):
+    """Return (events, last_mtime). Only the tail is parsed — these reach MBs —
+    and the result is cached until the file grows, because the overview would
+    otherwise re-parse every transcript on every frame."""
+    ev = []
+    if not path or not path.exists(): return ev, None
+    st = path.stat()
+    key = (str(path), tail_bytes)
+    hit = _TCACHE.get(key)
+    if hit and hit[0] == (st.st_size, st.st_mtime):
+        return hit[1], st.st_mtime
+    size = st.st_size
+    with path.open("rb") as f:
+        if size > tail_bytes:
+            f.seek(size - tail_bytes); f.readline()
+        chunk = f.read().decode("utf-8", "replace")
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line.startswith("{"): continue
+        try: d = json.loads(line)
+        except Exception: continue
+        if d.get("type") != "assistant": continue
+        ts = d.get("timestamp")
+        for b in d.get("message", {}).get("content", []):
+            if b.get("type") == "text" and b.get("text", "").strip():
+                ev.append(("say", " ".join(b["text"].split()), ts))
+            elif b.get("type") == "tool_use":
+                inp = b.get("input") or {}
+                tgt = (inp.get("file_path") or inp.get("path") or inp.get("pattern")
+                       or inp.get("command") or inp.get("description") or "")
+                tgt = " ".join(str(tgt).split())
+                if len(tgt) > 70: tgt = tgt[:69] + "…"
+                ev.append(("tool", (b.get("name") or "?", tgt), ts))
+    if len(_TCACHE) > 64: _TCACHE.clear()
+    _TCACHE[key] = ((st.st_size, st.st_mtime), ev)
+    return ev, st.st_mtime
+
+PHASE = {"Read": "reading", "Grep": "searching", "Glob": "searching",
+         "Edit": "editing", "Write": "writing", "NotebookEdit": "editing",
+         "Bash": "running", "Task": "delegating", "WebFetch": "fetching",
+         "WebSearch": "searching", "TodoWrite": "planning"}
+
+# ------------------------------------------------------------------ state ---
+TASK_RE = re.compile(r"^===\s*(?:YOUR TASK|TASK)\s*[—:-]*\s*(.*?)\s*===\s*$", re.M)
+
+def adopt(pid, rid, args):
+    reg = REG / f"{rid}.json"
+    if reg.exists(): return
+    brief, title = Path(f"/tmp/{rid}.brief"), ""
+    if brief.exists():
+        try:
+            txt = brief.read_text("utf-8", "replace")
+            m = TASK_RE.search(txt)
+            title = m.group(1) if m and m.group(1) else ""
+            if not title:
+                for ln in (l.strip() for l in txt.splitlines()):
+                    if len(ln) > 40 and not ln.startswith(("=", "-", "#", "NEVER", "Do not")):
+                        title = ln[:120]; break
+        except Exception: pass
+    cwd = ""
+    try:
+        lo = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                            capture_output=True, text=True, timeout=10).stdout
+        for l in lo.splitlines():
+            if l.startswith("n"): cwd = l[1:]
+    except Exception: pass
+    branch = ""
+    if cwd:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip() != "HEAD": branch = r.stdout.strip()
+    mo, ef = re.search(r"--model (\S+)", args), re.search(r"--effort (\S+)", args)
+    try:
+        reg.write_text(json.dumps({
+            "id": rid, "title": title or f"(no task marker in {rid}.brief)",
+            "worktree": cwd, "wt_name": Path(cwd).name if cwd else "",
+            "branch": branch, "model": mo.group(1) if mo else "",
+            "effort": ef.group(1) if ef else "", "pid": pid,
+            "started": brief.stat().st_mtime if brief.exists() else time.time(),
+            "brief": str(brief), "adopted": True}, indent=2))
+    except Exception: pass
+
+def wt_dirty(worktree):
+    if not worktree: return None
+    if not Path(worktree).is_dir(): return "gone"
+    try:
+        r = subprocess.run(["git", "-C", worktree, "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0: return None
+        return len([l for l in r.stdout.splitlines() if l.strip()])
+    except Exception:
+        return "gone"
+
+def collect():
+    ps = ps_snapshot()
+    known = {f.stem for f in REG.glob("*.json") if f.name != "calibration.json"}
+    for pid, rid, args in strays(ps, known):
+        if rid: adopt(pid, rid, args)
+    runs = []
+    for f in sorted(REG.glob("*.json")):
+        if f.name == "calibration.json": continue
+        try: r = json.loads(f.read_text())
+        except Exception: continue
+        r["running"] = alive(r.get("pid"), r["id"], ps)
+        r["tpath"]   = transcript_for(r.get("worktree"), r.get("started"), r["id"])
+        # our own stream is named for the run, not the session; find the id inside
+        r["sid"]     = (r["tpath"].stem if r["tpath"] and r["tpath"].parent == PROJ.joinpath(r["tpath"].parent.name)
+                        else None)
+        if r["tpath"] and r["tpath"].parent == REG:
+            r["sid"] = session_id_in(r["tpath"])
+        elif r["tpath"]:
+            r["sid"] = r["tpath"].stem
+        r["dirty"]   = wt_dirty(r.get("worktree"))
+        if r.get("fifo") and not Path(r["fifo"]).exists(): r["fifo"] = None
+        runs.append(r)
+    runs.sort(key=lambda r: (0 if r["running"] else 1, -r.get("started", 0)))
+    return runs
+
+def calibration():
+    p = REG / "calibration.json"
+    try: return json.loads(p.read_text())
+    except Exception: return None
+
+# ----------------------------------------------------------------- screen ---
+class Screen:
+    def __init__(self):
+        self.rows, self.cols = 24, 80
+        self.measure()
+    def measure(self):
+        try:
+            sz = os.get_terminal_size()
+            self.rows, self.cols = sz.lines, sz.columns
+        except OSError:
+            pass
+    def enter(self):
+        sys.stdout.write(f"{E}?1049h{E}?25l"); sys.stdout.flush()
+    def leave(self):
+        sys.stdout.write(f"{E}?25h{E}?1049l"); sys.stdout.flush()
+    def paint(self, lines):
+        self.measure()
+        body = "\r\n".join(l + f"{E}K" for l in lines[: self.rows])
+        sys.stdout.write(f"{E}H" + body + f"{E}J"); sys.stdout.flush()
+
+def wrap(text, width):
+    out, cur = [], ""
+    for w in str(text).split():
+        if len(cur) + len(w) + 1 > width:
+            out.append(cur); cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur: out.append(cur)
+    return out or [""]
+
+def read_key(timeout):
+    """Return a key name, or None on timeout. Distinguishes bare esc from arrows
+    by looking for a follow-on byte with a short grace period."""
+    if not select.select([sys.stdin], [], [], timeout)[0]:
+        return None
+    ch = sys.stdin.read(1)
+    if ch != "\x1b":
+        return {"\r": "enter", "\n": "enter", "\x7f": "back", "\x03": "q"}.get(ch, ch)
+    if not select.select([sys.stdin], [], [], 0.05)[0]:
+        return "esc"
+    if sys.stdin.read(1) != "[":
+        return "esc"
+    c = sys.stdin.read(1)
+    return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(c, "esc")
+
+def prompt(scr, label):
+    """Cooked-mode single-line input, drawn on the bottom row."""
+    sys.stdout.write(f"{E}{scr.rows};1H{E}K{E}?25h" + bold(label)); sys.stdout.flush()
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, ORIGINAL)
+        line = sys.stdin.readline()
+    except Exception:
+        line = ""
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        tty.setraw(fd)
+        sys.stdout.write(f"{E}?25l"); sys.stdout.flush()
+    return line.strip()
+
+def send_live(run, text):
+    """Queue a message straight into a running agent's stdin. It arrives at the
+    agent's next turn boundary — this is not an interrupt, and cannot stop work
+    already in flight."""
+    fifo = run.get("fifo")
+    if not (fifo and Path(fifo).exists()): return None
+    try:
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"type": "user", "message": {"role": "user",
+                    "content": [{"type": "text", "text": text}]}}) + "\n")
+        return ("delivered to the live agent — it will pick this up at its next "
+                "turn. Watch the feed above for its response.")
+    except Exception as e:
+        return f"(could not reach the live agent: {e})"
+
+def send_message(run, text):
+    """Resume the agent's own session and ask it something. Fork while it is
+    still running, so two processes never share one session."""
+    if not run.get("sid"): return "This run has no session transcript to resume."
+    cmd = ["claude", "--resume", run["sid"], "-p", text,
+           "--permission-mode", "bypassPermissions"]
+    if run["running"]: cmd.insert(3, "--fork-session")
+    try:
+        r = subprocess.run(cmd, cwd=run.get("worktree") or None, input="",
+                           capture_output=True, text=True, timeout=900)
+        return (r.stdout or r.stderr or "(no reply)").strip()
+    except subprocess.TimeoutExpired:
+        return "(timed out after 15 minutes)"
+    except Exception as e:
+        return f"(failed: {e})"
+
+# ------------------------------------------------------------------ views ---
+def overview(runs, sel, show_all, cal, W):
+    live = sum(1 for r in runs if r["running"])
+    rev  = sum(1 for r in runs if not r["running"]
+               and isinstance(r["dirty"], int) and r["dirty"])
+    gone = sum(1 for r in runs if r["running"] and r["dirty"] == "gone")
+    head = f"AGENTS · {live} running · {rev} needs review"
+    if gone: head += f" · {gone} WORKTREE GONE MID-RUN"
+    L = ["", " " + bold(head), " " + dim("─" * min(W - 2, 74))]
+    now, hidden = time.time(), 0
+    for i, r in enumerate(runs):
+        idle = (not r["running"]
+                and (r["dirty"] in (0, None) or r["dirty"] == "gone"))
+        if idle and not show_all:
+            hidden += 1; continue
+        ev, mtime = (read_transcript(r["tpath"], 60_000) if r["running"]
+                     else ([], r["tpath"].stat().st_mtime if r["tpath"] else None))
+        stalled = r["running"] and mtime and (now - mtime) > STALL
+        if stalled:        mark, tone = "⚠", yellow
+        elif r["running"]: mark, tone = "●", green
+        elif isinstance(r["dirty"], int) and r["dirty"]: mark, tone = "✓", cyan
+        else:              mark, tone = "✓", dim
+        meta  = "/".join(v for v in (r.get("model"), r.get("effort")) if v)
+        where = r.get("wt_name") or "?"
+        if r.get("branch"): where += " → " + r["branch"]
+        row = (f" {tone(mark)} {bold(r['id']):<12}"
+               f"{hms(now - r.get('started', now)):>6} · {meta:<12} {dim(where)}")
+        L.append(inv(f"{E}0m" + row) if i == sel else row)
+        for ln in wrap(r.get("title", ""), W - 6)[:2]:
+            L.append("   " + ln)
+        if r["running"]:
+            say  = next((v for k, v, _ in reversed(ev) if k == "say"), None)
+            tool = next((v for k, v, _ in reversed(ev) if k == "tool"), None)
+            if tool:
+                ph  = PHASE.get(tool[0], tool[0])
+                age = hms(now - mtime) if mtime else "?"
+                room = max(20, W - 22)
+                left = f"   ▸ {ph}  {tool[1]}"
+                if len(left) > room: left = left[: room - 1] + "…"
+                L.append(f"{left:<{room}}  " + dim(f"{age} ago"))
+            if say:
+                for ln in wrap("“" + say[:200] + "”", W - 8)[:2]:
+                    L.append("     " + dim(ln))
+            if stalled:
+                L.append("   " + yellow(f"no events for {hms(now - mtime)} — may be hung"))
+            elif cal and cal.get("median_min") and (now - r.get("started", now)) > 120:
+                L.append("   " + dim(f"typical {cal['p25_min']}–{cal['p75_min']}m "
+                                     f"across {cal['n']} past runs"))
+        else:
+            if r["dirty"] == "gone":
+                L.append("   " + dim("worktree removed — cannot verify what was harvested"))
+            elif isinstance(r["dirty"], int) and r["dirty"]:
+                L.append("   " + yellow(f"{r['dirty']} file"
+                                        f"{'s' if r['dirty'] != 1 else ''} UNCOMMITTED"))
+        L.append("")
+    if hidden and not show_all:
+        L.append(" " + dim(f"{hidden} finished and harvested · a to show"))
+    return L
+
+def detail(run, ev, mtime, scroll, W, H, reply):
+    now = time.time()
+    state = green("running") if run["running"] else dim("finished")
+    L = ["", " " + bold(run["id"]) + "  " + state
+         + dim(f"   {hms(now - run.get('started', now))}"
+               f"   {run.get('model','')}/{run.get('effort','')}"
+               f"   {run.get('wt_name','')}")]
+    for ln in wrap(run.get("title", ""), W - 3):
+        L.append(" " + ln)
+    if run.get("sid"): L.append(" " + dim("session " + run["sid"]))
+    if run["running"]:
+        L.append(" " + (green("live input open — m sends a real message")
+                        if run.get("fifo") and Path(run["fifo"]).exists()
+                        else dim("no live channel — m asks a forked copy instead")))
+    L.append(" " + dim("─" * min(W - 2, 74)))
+
+    feed = []
+    for kind, val, _ in ev:
+        if kind == "say":
+            feed += ["  " + ln for ln in wrap(val, W - 4)]
+            feed.append("")
+        else:
+            feed.append("  " + dim(f"· {PHASE.get(val[0], val[0])}  {val[1]}"[: W - 4]))
+    if reply:
+        feed += ["", "  " + cyan("── your message ──")]
+        feed += ["  " + ln for ln in wrap(reply[0], W - 4)]
+        feed += ["", "  " + cyan("── reply ──")]
+        for para in reply[1].splitlines():
+            feed += ["  " + ln for ln in wrap(para, W - 4)] if para.strip() else [""]
+
+    room = H - len(L) - 2
+    start = max(0, len(feed) - room - scroll)
+    L += feed[start:start + room] if room > 0 else []
+    while len(L) < H - 1: L.append("")
+    tail = "  ↑↓ scroll · ← back · m message · q quit"
+    if scroll: tail += f"   (scrolled back {scroll})"
+    L.append(dim(tail))
+    return L
+
+# ------------------------------------------------------------------- main ---
+ORIGINAL = None
+
+def main():
+    global ORIGINAL
+    # One plain snapshot, same data layer as the TUI so the two cannot drift.
+    if "--once" in sys.argv:
+        global _COLOR
+        _COLOR = _COLOR and sys.stdout.isatty()
+        runs = collect()
+        for l in overview(runs, -1, "--all" in sys.argv, calibration(),
+                          (os.get_terminal_size().columns if sys.stdout.isatty() else 96)):
+            print(l)
+        return
+    if not sys.stdin.isatty():
+        print("agentrun-tui needs a terminal (run it via `mini`)"); return
+    fd = sys.stdin.fileno()
+    ORIGINAL = termios.tcgetattr(fd)
+    scr = Screen(); scr.enter(); tty.setraw(fd)
+    sel, show_all, view, scroll, reply = 0, False, "list", 0, None
+    runs, last = collect(), 0.0
+    try:
+        while True:
+            if time.time() - last > 2.0:
+                runs, last = collect(), time.time()
+                sel = min(sel, max(0, len(runs) - 1))
+            if view == "list":
+                scr.paint(overview(runs, sel, show_all, calibration(), scr.cols))
+            else:
+                run = runs[sel]
+                ev, mtime = read_transcript(run["tpath"])
+                scr.paint(detail(run, ev, mtime, scroll, scr.cols, scr.rows, reply))
+            k = read_key(1.0)
+            if k is None: continue
+            if k == "q": break
+            if view == "list":
+                if   k == "down":  sel = min(sel + 1, len(runs) - 1)
+                elif k == "up":    sel = max(sel - 1, 0)
+                elif k == "a":     show_all = not show_all
+                elif k in ("enter", "right") and runs:
+                    view, scroll, reply = "detail", 0, None
+            else:
+                if   k in ("left", "esc", "back"): view, scroll, reply = "list", 0, None
+                elif k == "up":    scroll += 3
+                elif k == "down":  scroll = max(0, scroll - 3)
+                elif k == "m":
+                    run = runs[sel]
+                    live = run["running"] and run.get("fifo")
+                    txt = prompt(scr, "message → " if live else "ask (forked copy) → ")
+                    if txt:
+                        scr.paint(["", "  " + dim("sending…" if live else "asking the agent…")])
+                        r = send_live(run, txt) if live else None
+                        reply = (txt, r if r is not None else send_message(run, txt))
+                        scroll = 0
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, ORIGINAL)
+        scr.leave()
+
+main()

@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Start a headless agent with a live input channel, and stay alive holding it.
+
+  agentrun-launch <id> <worktree> <brief-file> <model> <effort>
+
+The FIFO is opened O_RDWR before the read end, because opening a pipe read-only
+blocks until a writer exists — that deadlocks. Holding a writer open also stops
+claude seeing EOF and exiting the moment the brief is delivered.
+"""
+import json, os, subprocess, sys, threading, time
+from pathlib import Path
+
+REG = Path.home() / ".agentrun"
+rid, wt, brief, model, effort = (sys.argv[1:6] + [""] * 5)[:5]
+REG.mkdir(exist_ok=True)
+fifo = REG / f"{rid}.fifo"
+if fifo.exists(): fifo.unlink()
+os.mkfifo(fifo, 0o600)
+
+wfd = os.open(fifo, os.O_RDWR)          # never blocks, and keeps the pipe open
+w   = os.fdopen(wfd, "w")
+rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+os.set_blocking(rfd, True)
+
+out = open(REG / f"{rid}.jsonl", "wb")
+cmd = ["claude", "-p",
+       "--input-format", "stream-json",
+       "--output-format", "stream-json",
+       "--include-partial-messages", "--verbose",
+       "--permission-mode", "bypassPermissions",
+       "--model", model or "sonnet"]
+if effort: cmd += ["--effort", effort]
+
+p = subprocess.Popen(cmd, stdin=rfd, stdout=out, stderr=subprocess.STDOUT, cwd=wt)
+
+reg = REG / f"{rid}.json"
+try:
+    r = json.loads(reg.read_text())
+except Exception:
+    r = {"id": rid}
+r.update({"pid": os.getpid(), "claude_pid": p.pid, "fifo": str(fifo),
+          "live_input": True})
+reg.write_text(json.dumps(r, indent=2))
+
+def send(text):
+    w.write(json.dumps({"type": "user", "message": {"role": "user",
+            "content": [{"type": "text", "text": text}]}}) + "\n")
+    w.flush()
+
+send(Path(brief).read_text("utf-8", "replace"))
+
+# With a writer held open, claude never sees EOF and so never exits on its own.
+# Watch our own stream: once it emits a result and then goes quiet for GRACE
+# seconds, the work is done and nobody is talking to it — close the channel.
+GRACE = int(os.environ.get("AGENTRUN_GRACE", "120"))
+
+def reaper():
+    stream = REG / f"{rid}.jsonl"
+    done_at = None
+    while p.poll() is None:
+        time.sleep(3)
+        try:
+            st = stream.stat()
+        except OSError:
+            continue
+        if done_at is None:
+            # cheap tail scan for a result event
+            try:
+                with stream.open("rb") as f:
+                    if st.st_size > 200_000: f.seek(st.st_size - 200_000)
+                    if b'"type":"result"' in f.read():
+                        done_at = time.time()
+                        try:
+                            r2 = json.loads(reg.read_text())
+                            r2["idle_since"] = done_at
+                            reg.write_text(json.dumps(r2, indent=2))
+                        except Exception: pass
+            except OSError:
+                continue
+        else:
+            # any new activity (an injected message) restarts the clock
+            if st.st_mtime > done_at:
+                done_at = st.st_mtime
+            elif time.time() - done_at > GRACE:
+                # Closing the pipe is not enough: claude in stream-json input mode
+                # does not exit on stdin EOF (verified 27.08), so ask it to stop.
+                # Safe here only because a result event has already been emitted.
+                try: w.close()
+                except Exception: pass
+                for _ in range(10):
+                    if p.poll() is not None: return
+                    time.sleep(1)
+                p.terminate()
+                for _ in range(8):
+                    if p.poll() is not None: return
+                    time.sleep(1)
+                p.kill()
+                return
+
+threading.Thread(target=reaper, daemon=True).start()
+
+try:
+    p.wait()
+finally:
+    try: w.close()
+    except Exception: pass
+    try: out.close()
+    except Exception: pass
+    try: fifo.unlink()
+    except Exception: pass
+    try:
+        r = json.loads(reg.read_text()); r["fifo"] = None; r["live_input"] = False
+        reg.write_text(json.dumps(r, indent=2))
+    except Exception: pass
+    subprocess.run([str(Path.home() / "bin" / "agentrun-finalize"), rid])

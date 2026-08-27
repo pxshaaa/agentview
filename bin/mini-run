@@ -1,0 +1,82 @@
+#!/bin/sh
+: "${AGENT_HOST:?set AGENT_HOST to the ssh host your agents run on}"
+# Launch a tracked headless Claude Code run on $AGENT_HOST.
+#   TITLE="what this run is for" mini_run.sh <worktree> <brief-file> <id> [model] [effort]
+# model:  sonnet (default, mechanical sweeps) | opus (diagnosis) | fable
+# effort: low | medium | high | xhigh | max. Default medium.
+#         Pass "inherit" to fall back to the mini's settings.json.
+ME=$(basename "$0")
+usage() {
+  cat <<USAGE
+usage:  TITLE="what this run is for" $ME <worktree> <brief-file> <id> [model] [effort]
+
+  worktree    absolute path ON THE REMOTE HOST, e.g.
+              /home/you/proj.worktrees/task-a
+  brief-file  path on THIS machine; it is copied over
+  id          short name, e.g. run124 — this is what \`mini\` shows
+  model       sonnet (default) | opus | fable
+  effort      low | medium (default) | high | xhigh | max | inherit
+
+example:
+  TITLE="Fix the country dropdown filter" \\
+    $ME /home/you/proj.worktrees/task-a \\
+        ~/briefs/dropdown.md run1 opus high
+
+then watch it with:  mini
+USAGE
+}
+WT="$1"; BRIEF="$2"; LOG="$3"; MODEL="${4:-sonnet}"; EFFORT="${5:-medium}"
+case "$1" in -h|--help) usage; exit 0 ;; esac
+[ -z "$WT" ] || [ -z "$BRIEF" ] || [ -z "$LOG" ] && { usage; exit 1; }
+[ -z "$TITLE" ] && { echo "REFUSING: set TITLE= so the run is identifiable in \`mini\`."; echo; usage; exit 1; }
+[ -f "$BRIEF" ] || { echo "REFUSING: brief file not found: $BRIEF"; exit 1; }
+
+case "$EFFORT" in
+  inherit) EFFORT="" ;;
+  low|medium|high|xhigh|max) ;;
+  *) echo "REFUSING: effort must be low|medium|high|xhigh|max (got '$EFFORT')"; exit 1 ;;
+esac
+[ -n "$EFFORT" ] && EFFORT_FLAG="--effort $EFFORT" || EFFORT_FLAG=""
+
+# Refuse to start on a dirty tree — a brief that begins with `git reset --hard`
+# destroyed an earlier run's uncommitted work.
+IS_REPO=$(ssh "$AGENT_HOST" "git -C '$WT' rev-parse --is-inside-work-tree 2>/dev/null || echo no")
+if [ "$IS_REPO" = "true" ]; then
+  DIRTY=$(ssh "$AGENT_HOST" "git -C '$WT' status --porcelain | grep -v -e '^$' ${AGENT_IGNORE:+-e $AGENT_IGNORE} | wc -l | tr -d ' '")
+  if [ "$DIRTY" != "0" ]; then
+    echo "REFUSING: $WT has $DIRTY uncommitted files. Commit or stash first."; exit 1
+  fi
+else
+  # Legitimate for read-only runs; say so rather than leaking git's fatal.
+  echo "note: $WT is not a git worktree — no isolation guard, harvest.sh will not work here"
+fi
+
+# Every brief ends the same way, so `mini` always has a summary to show.
+TMPB=$(mktemp)
+cat "$BRIEF" > "$TMPB"
+cat >> "$TMPB" <<'SUMEOF'
+
+=== HOW TO END ===
+Make the LAST line of your final output:
+SUMMARY: <two sentences — what you changed, and what needs the orchestrator's attention>
+One line, no markdown. Say plainly if you changed nothing or stopped early.
+SUMEOF
+scp -q "$TMPB" "$AGENT_HOST:/tmp/$LOG.brief" || exit 1; rm -f "$TMPB"
+
+BRANCH=$(ssh "$AGENT_HOST" "git -C '$WT' rev-parse --abbrev-ref HEAD 2>/dev/null" 2>/dev/null)
+[ "$BRANCH" = "HEAD" ] && BRANCH=""
+ssh "$AGENT_HOST" "mkdir -p ~/.agentrun && python3 -c \"
+import json,time,os
+from pathlib import Path
+p=Path.home()/'.agentrun'/'$LOG.json'
+p.write_text(json.dumps({'id':'$LOG','title':'''$TITLE''','worktree':'$WT',
+ 'wt_name':os.path.basename('$WT'),'branch':'$BRANCH','model':'$MODEL',
+ 'effort':'$EFFORT','started':time.time(),'brief':'/tmp/$LOG.brief','pid':None},indent=2))
+\""
+
+# ssh gives a 256-fd soft limit; claude dies instantly with an "unknown error" above it (25.08).
+# agentrun-launch owns a FIFO on claude's stdin so the run stays reachable: pressing
+# `m` in `mini` queues a real message to the live agent (delivered at its next turn).
+ssh "$AGENT_HOST" "cd '$WT' && ulimit -n 65536 && nohup ~/bin/agentrun-launch '$LOG' '$WT' '/tmp/$LOG.brief' '$MODEL' '$EFFORT' >/dev/null 2>&1 &"
+echo "launched $LOG on $MODEL${EFFORT:+ at $EFFORT effort} in $WT"
+echo "watch it with: mini   (press m inside to message it live)"
