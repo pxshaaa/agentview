@@ -10,7 +10,7 @@ claude seeing EOF and exiting the moment the brief is delivered.
 import json, os, subprocess, sys, threading, time
 from pathlib import Path
 
-REG = Path.home() / ".agentrun"
+REG = Path(os.environ.get("AGENTRUN_DIR") or (Path.home() / ".agentrun"))
 rid, wt, brief, model, effort = (sys.argv[1:6] + [""] * 5)[:5]
 REG.mkdir(exist_ok=True)
 fifo = REG / f"{rid}.fifo"
@@ -112,4 +112,15 @@ finally:
         r = json.loads(reg.read_text()); r["fifo"] = None; r["live_input"] = False
         reg.write_text(json.dumps(r, indent=2))
     except Exception: pass
-    subprocess.run([str(Path.home() / "bin" / "agentrun-finalize"), rid])
+    # A silent failure here means no report and no SUMMARY, which looks like the
+    # agent produced nothing. Surface it in the stream instead of swallowing it.
+    fin = subprocess.run([str(Path.home() / "bin" / "agentrun-finalize"), rid],
+                         capture_output=True, text=True)
+    if fin.returncode != 0:
+        try:
+            with (REG / f"{rid}.jsonl").open("a") as f:
+                f.write(json.dumps({"type": "agentview_error",
+                                    "error": "agentrun-finalize failed",
+                                    "detail": (fin.stderr or "")[-800:]}) + "\n")
+        except Exception:
+            pass

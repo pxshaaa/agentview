@@ -12,7 +12,7 @@ writes are run metadata under ~/.agentrun and messages you deliberately send.
 import json, os, re, select, subprocess, sys, termios, time, tty
 from pathlib import Path
 
-REG   = Path.home() / ".agentrun"
+REG   = Path(os.environ.get("AGENTRUN_DIR") or (Path.home() / ".agentrun"))
 PROJ  = Path.home() / ".claude" / "projects"
 STALL = int(os.environ.get("AGENTRUN_STALL") or 600)
 
@@ -220,8 +220,11 @@ def wt_dirty(worktree):
 def collect():
     ps = ps_snapshot()
     known = {f.stem for f in REG.glob("*.json") if f.name != "calibration.json"}
-    for pid, rid, args in strays(ps, known):
-        if rid: adopt(pid, rid, args)
+    # Adoption scans every claude -p on the box, so it will pull unrelated runs
+    # into whatever registry is active. Opt out when you want an isolated view.
+    if not os.environ.get("AGENTRUN_NO_ADOPT"):
+        for pid, rid, args in strays(ps, known):
+            if rid: adopt(pid, rid, args)
     runs = []
     for f in sorted(REG.glob("*.json")):
         if f.name == "calibration.json": continue
@@ -369,7 +372,7 @@ def overview(runs, sel, show_all, cal, W):
         row = (f" {tone(mark)} {bold(r['id']):<12}"
                f"{hms(now - r.get('started', now)):>6} · {meta:<12} {dim(where)}")
         L.append(inv(f"{E}0m" + row) if i == sel else row)
-        for ln in wrap(r.get("title", ""), W - 6)[:2]:
+        for ln in wrap(r.get("title", ""), W - 8)[:2]:
             L.append("   " + ln)
         if r["running"]:
             say  = next((v for k, v, _ in reversed(ev) if k == "say"), None)
@@ -382,7 +385,7 @@ def overview(runs, sel, show_all, cal, W):
                 if len(left) > room: left = left[: room - 1] + "…"
                 L.append(f"{left:<{room}}  " + dim(f"{age} ago"))
             if say:
-                for ln in wrap("“" + say[:200] + "”", W - 8)[:2]:
+                for ln in wrap("“" + say[:200] + "”", W - 12)[:2]:
                     L.append("     " + dim(ln))
             if stalled:
                 L.append("   " + yellow(f"no events for {hms(now - mtime)} — may be hung"))
@@ -397,7 +400,7 @@ def overview(runs, sel, show_all, cal, W):
                                         f"{'s' if r['dirty'] != 1 else ''} UNCOMMITTED"))
             sm = summary_for(r["id"])
             if sm:
-                for j, ln in enumerate(wrap(sm, W - 8)[:3]):
+                for j, ln in enumerate(wrap(sm, W - 14)[:3]):
                     L.append("   " + (dim("SUMMARY: ") if j == 0 else "         ") + dim(ln))
         L.append("")
     if hidden and not show_all:

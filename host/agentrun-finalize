@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run once when an agent exits: extract its final report and stamp the
 registry. Read-only with respect to the repos — touches only ~/.agentrun."""
-import json, sys, time
+import json, os, sys, time
 from pathlib import Path
-REG = Path.home() / ".agentrun"
+REG = Path(os.environ.get("AGENTRUN_DIR") or (Path.home() / ".agentrun"))
 rid = sys.argv[1]
 reg, js = REG / f"{rid}.json", REG / f"{rid}.jsonl"
 final, err = None, None

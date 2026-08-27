@@ -7,7 +7,7 @@
 #   mini show <id>    that run's report + uncommitted diffstat, as plain text
 # These are documented config, and they are set on the client while the code
 # runs on the remote host. ssh does not carry env across, so pass it explicitly.
-ENVFWD="AGENT_IGNORE='${AGENT_IGNORE:-}' AGENTRUN_STALL='${AGENTRUN_STALL:-}'"
+ENVFWD="AGENT_IGNORE='${AGENT_IGNORE:-}' AGENTRUN_STALL='${AGENTRUN_STALL:-}' AGENTRUN_DIR='${AGENTRUN_DIR:-}' AGENTRUN_NO_ADOPT='${AGENTRUN_NO_ADOPT:-}'"
 
 case "${1:-}" in
   once|status) ssh "$AGENT_HOST" "$ENVFWD ~/bin/agentrun-tui --once" ;;

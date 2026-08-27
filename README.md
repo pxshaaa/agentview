@@ -28,21 +28,8 @@ something else, and only found it when I went looking for something unrelated.
 agentview puts every agent on one screen, live, shows you which ones finished
 with work you never collected, and lets you send them a message while they run.
 
-```
-AGENTS · 2 running · 1 needs review
+![agentview](demo/agentview.gif)
 
- ● run121   29m · opus/high    task-b
-   Does the onboarding conflict card actually fire?
-   ▸ running  npx jest src/components/__tests__       5s ago
-     "Now proving the tests were red before the fix."
-   typical 16–33m across 24 past runs
-
- ✓ run118   52m · opus/high    task-a
-   Rework the country filter
-   9 files UNCOMMITTED
-   SUMMARY: Fixed the filter and added a regression test. The sentinel
-   string is still hardcoded in English, worth a follow-up.
-```
 
 ## Requirements
 
@@ -164,13 +151,17 @@ you care about without a clean git state.
 | `AGENT_IGNORE` | pattern excluded from the dirty worktree check |
 | `AGENTRUN_STALL` | seconds of silence before a run is flagged, default 600 |
 | `AGENTRUN_GRACE` | seconds an idle agent stays reachable, default 120 |
+| `AGENTRUN_DIR` | where run metadata lives, default `~/.agentrun` |
+| `AGENTRUN_NO_ADOPT` | set to skip picking up agents you did not launch |
 
 ## Known limits
 
 * one remote host, local agents aren't shown
 * messages queue to a turn boundary, there's no interrupt
 * runs not launched by `mini-run` get adopted automatically but have no input
-  channel and can't be given one afterwards
+  channel and can't be given one afterwards. Adoption scans every `claude -p` on
+  the machine, so set `AGENTRUN_NO_ADOPT=1` if you want a view of only your own
+  runs.
 * the duration estimate is a band from past runs, not a real projection. Agents
   aren't linear and I'd rather show a wide honest range than a fake percentage.
 
@@ -181,3 +172,13 @@ I use it daily. Issues and PRs welcome, but it's shaped around one workflow:
 agents in git worktrees on a remote box, one per task.
 
 MIT.
+
+## Regenerating the demo
+
+The GIF is a real recording, not a mockup. `demo/demo.tape` drives the actual
+dashboard against a throwaway registry so no real work appears in it.
+
+```sh
+brew install vhs
+AGENTRUN_DIR=/tmp/demoreg AGENTRUN_NO_ADOPT=1 vhs demo/demo.tape
+```

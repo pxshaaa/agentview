@@ -65,10 +65,10 @@ scp -q "$TMPB" "$AGENT_HOST:/tmp/$LOG.brief" || exit 1; rm -f "$TMPB"
 
 BRANCH=$(ssh "$AGENT_HOST" "git -C '$WT' rev-parse --abbrev-ref HEAD 2>/dev/null" 2>/dev/null)
 [ "$BRANCH" = "HEAD" ] && BRANCH=""
-ssh "$AGENT_HOST" "mkdir -p ~/.agentrun && python3 -c \"
+ssh "$AGENT_HOST" "mkdir -p \${AGENTRUN_DIR:-~/.agentrun} && AGENTRUN_DIR='${AGENTRUN_DIR:-}' python3 -c \"
 import json,time,os
 from pathlib import Path
-p=Path.home()/'.agentrun'/'$LOG.json'
+p=Path(os.environ.get('AGENTRUN_DIR') or (Path.home()/'.agentrun'))/'$LOG.json'
 p.write_text(json.dumps({'id':'$LOG','title':'''$TITLE''','worktree':'$WT',
  'wt_name':os.path.basename('$WT'),'branch':'$BRANCH','model':'$MODEL',
  'effort':'$EFFORT','started':time.time(),'brief':'/tmp/$LOG.brief','pid':None},indent=2))
@@ -77,6 +77,6 @@ p.write_text(json.dumps({'id':'$LOG','title':'''$TITLE''','worktree':'$WT',
 # ssh gives a 256-fd soft limit; claude dies instantly with an "unknown error" above it (25.08).
 # agentrun-launch owns a FIFO on claude's stdin so the run stays reachable: pressing
 # `m` in `mini` queues a real message to the live agent (delivered at its next turn).
-ssh "$AGENT_HOST" "cd '$WT' && ulimit -n 65536 && nohup ~/bin/agentrun-launch '$LOG' '$WT' '/tmp/$LOG.brief' '$MODEL' '$EFFORT' >/dev/null 2>&1 &"
+ssh "$AGENT_HOST" "cd '$WT' && ulimit -n 65536 && AGENTRUN_DIR='${AGENTRUN_DIR:-}' nohup ~/bin/agentrun-launch '$LOG' '$WT' '/tmp/$LOG.brief' '$MODEL' '$EFFORT' >/dev/null 2>&1 &"
 echo "launched $LOG on $MODEL${EFFORT:+ at $EFFORT effort} in $WT"
 echo "watch it with: mini   (press m inside to message it live)"
