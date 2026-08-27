@@ -201,6 +201,45 @@ def summary_for(rid):
                 return " ".join(t.split(":", 1)[1].split())
     return None
 
+def wt_files(worktree, limit=12):
+    """Which files the agent has actually touched, newest first. A young run has
+    almost no events, so this is often the only concrete thing to show."""
+    if not worktree or not Path(worktree).is_dir(): return []
+    try:
+        r = subprocess.run(["git", "-C", worktree, "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0: return []
+        out = []
+        for l in r.stdout.splitlines():
+            if not l.strip(): continue
+            code, name = l[:2].strip() or "?", l[3:].strip().strip('"')
+            try: mt = (Path(worktree) / name).stat().st_mtime
+            except OSError: mt = 0
+            out.append((mt, code, name))
+        out.sort(reverse=True)
+        return out[:limit]
+    except Exception:
+        return []
+
+def brief_task(path, lines=10):
+    """The task section of the brief, so the panel says what the run is for."""
+    if not path: return []
+    p = Path(path)
+    if not p.exists(): return []
+    try: txt = p.read_text("utf-8", "replace")
+    except Exception: return []
+    out, started = [], False
+    for ln in txt.splitlines():
+        if ln.strip().startswith("===") and ("TASK" in ln.upper()):
+            started = True; continue
+        if started:
+            if ln.strip().startswith("==="): break
+            if ln.strip(): out.append(ln.rstrip())
+        if len(out) >= lines: break
+    if not out:
+        out = [l.rstrip() for l in txt.splitlines() if l.strip()][:lines]
+    return out[:lines]
+
 def wt_dirty(worktree):
     """int = uncommitted files (minus AGENT_IGNORE matches), "gone" = worktree
     vanished, None = not a repo. Gone must never look the same as clean."""
@@ -293,19 +332,30 @@ def wrap(text, width):
     return out or [""]
 
 def read_key(timeout):
-    """Return a key name, or None on timeout. Distinguishes bare esc from arrows
-    by looking for a follow-on byte with a short grace period."""
-    if not select.select([sys.stdin], [], [], timeout)[0]:
+    """Return a key name, or None on timeout.
+
+    Reads through os.read on the raw fd rather than sys.stdin. Python buffers
+    stdin internally, so after reading the ESC of an arrow sequence the rest sat
+    in that buffer while select reported the fd empty, and every arrow key came
+    through as three separate keypresses.
+    """
+    fd = sys.stdin.fileno()
+    if not select.select([fd], [], [], timeout)[0]:
         return None
-    ch = sys.stdin.read(1)
-    if ch != "\x1b":
-        return {"\r": "enter", "\n": "enter", "\x7f": "back", "\x03": "q"}.get(ch, ch)
-    if not select.select([sys.stdin], [], [], 0.05)[0]:
+    try: ch = os.read(fd, 1)
+    except OSError: return None
+    if not ch: return None
+    if ch != b"\x1b":
+        return {b"\r": "enter", b"\n": "enter",
+                b"\x7f": "back", b"\x03": "q"}.get(ch, ch.decode("utf-8", "replace"))
+    # escape: an arrow sends ESC [ A..D, a bare esc sends nothing more
+    if not select.select([fd], [], [], 0.06)[0]:
         return "esc"
-    if sys.stdin.read(1) != "[":
+    try: rest = os.read(fd, 8)
+    except OSError: return "esc"
+    if rest[:1] != b"[":
         return "esc"
-    c = sys.stdin.read(1)
-    return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(c, "esc")
+    return {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}.get(rest[1:2], "esc")
 
 def prompt(scr, label):
     """Cooked-mode single-line input, drawn on the bottom row."""
@@ -356,6 +406,17 @@ def send_message(run, text):
         return f"(failed: {e})"
 
 # ------------------------------------------------------------------ views ---
+def visible_runs(runs, show_all):
+    """Rows actually on screen. The selection indexes these, not every run:
+    with finished runs hidden, indexing the full list opens the wrong one."""
+    if show_all: return list(runs)
+    out = []
+    for r in runs:
+        idle = (not r["running"] and not r.get("shared_with")
+                and (r["dirty"] in (0, None) or r["dirty"] == "gone"))
+        if not idle: out.append(r)
+    return out
+
 def overview(runs, sel, show_all, cal, W, H=0):
     live = sum(1 for r in runs if r["running"])
     rev  = sum(1 for r in runs if not r["running"]
@@ -364,8 +425,8 @@ def overview(runs, sel, show_all, cal, W, H=0):
     head = f"AGENTS · {live} running · {rev} needs review"
     if gone: head += f" · {gone} WORKTREE GONE MID-RUN"
     L = ["", " " + bold(head), " " + dim("─" * min(W - 2, 74))]
-    now, hidden = time.time(), 0
-    for i, r in enumerate(runs):
+    now, hidden, vi = time.time(), 0, -1
+    for r in runs:
         idle = (not r["running"] and not r.get("shared_with")
                 and (r["dirty"] in (0, None) or r["dirty"] == "gone"))
         if idle and not show_all:
@@ -381,11 +442,21 @@ def overview(runs, sel, show_all, cal, W, H=0):
         where = r.get("wt_name") or "?"
         if r.get("branch") and r["branch"] != r.get("wt_name"):
             where += " → " + r["branch"]
-        row = (f" {tone(mark)} {bold(r['id']):<12}"
-               f"{hms(now - r.get('started', now)):>6} · {meta:<12} {dim(where)}")
-        L.append(inv(f"{E}0m" + row) if i == sel else row)
+        vi += 1                       # index among visible rows only
+        picked = (vi == sel)
+        # A selected row is drawn as plain text then inverted whole. Colour codes
+        # inside it reset the inversion partway, which is why it looked unselected.
+        if picked:
+            plain = (f" {mark} {r['id']:<12}"
+                     f"{hms(now - r.get('started', now)):>6} · {meta:<12} {where}")
+            L.append(inv(plain[:W].ljust(min(W, 78))))
+        else:
+            L.append(f" {tone(mark)} {bold(r['id']):<12}"
+                     f"{hms(now - r.get('started', now)):>6} · {meta:<12} {dim(where)}")
+        # a gutter marks which block belongs to the selected row
+        g = cyan("\u2502") + " " if picked else "  "
         for ln in wrap(r.get("title", ""), W - 8)[:2]:
-            L.append("   " + ln)
+            L.append(g + " " + ln)
         if r["running"]:
             say  = next((v for k, v, _ in reversed(ev) if k == "say"), None)
             tool = next((v for k, v, _ in reversed(ev) if k == "tool"), None)
@@ -395,28 +466,28 @@ def overview(runs, sel, show_all, cal, W, H=0):
                 room = max(20, W - 22)
                 left = f"   ▸ {ph}  {tool[1]}"
                 if len(left) > room: left = left[: room - 1] + "…"
-                L.append(f"{left:<{room}}  " + dim(f"{age} ago"))
+                L.append(g + f"{left:<{room}}  " + dim(f"{age} ago"))
             if say:
                 for ln in wrap("“" + say[:200] + "”", W - 12)[:2]:
-                    L.append("     " + dim(ln))
+                    L.append(g + "    " + dim(ln))
             if stalled:
-                L.append("   " + yellow(f"no events for {hms(now - mtime)} — may be hung"))
+                L.append(g + "  " + yellow(f"no events for {hms(now - mtime)}, may be hung"))
             elif cal and cal.get("median_min") and (now - r.get("started", now)) > 120:
-                L.append("   " + dim(f"typical {cal['p25_min']}–{cal['p75_min']}m "
-                                     f"across {cal['n']} past runs"))
+                L.append(g + "  " + dim(f"typical {cal['p25_min']}–{cal['p75_min']}m "
+                                          f"across {cal['n']} past runs"))
         else:
             if r["dirty"] == "gone":
-                L.append("   " + dim("worktree removed — cannot verify what was harvested"))
+                L.append(g + "  " + dim("worktree removed, cannot verify what was harvested"))
             elif r.get("shared_with"):
-                L.append("   " + dim(f"shares worktree with {r['shared_with']}, "
+                L.append(g + "  " + dim(f"shares worktree with {r['shared_with']}, "
                                      f"which holds the uncommitted work"))
             elif isinstance(r["dirty"], int) and r["dirty"]:
-                L.append("   " + yellow(f"{r['dirty']} file"
+                L.append(g + "  " + yellow(f"{r['dirty']} file"
                                         f"{'s' if r['dirty'] != 1 else ''} UNCOMMITTED"))
             sm = summary_for(r["id"])
             if sm:
                 for j, ln in enumerate(wrap(sm, W - 14)[:3]):
-                    L.append("   " + (dim("SUMMARY: ") if j == 0 else "         ") + dim(ln))
+                    L.append(g + "  " + (dim("SUMMARY: ") if j == 0 else "         ") + dim(ln))
         L.append("")
     if hidden and not show_all:
         L.append(" " + dim(f"{hidden} finished and harvested · a to show"))
@@ -434,6 +505,13 @@ def detail(run, ev, mtime, scroll, W, H, reply):
                f"   {run.get('wt_name','')}")]
     for ln in wrap(run.get("title", ""), W - 3):
         L.append(" " + ln)
+    tools = sum(1 for k, _, _ in ev if k == "tool")
+    age   = hms(now - mtime) if mtime else "?"
+    files = wt_files(run.get("worktree"))
+    stats = f"{tools} tool calls · last activity {age} ago · {len(files)} files touched"
+    if run.get("total_cost_usd"): stats += f" · ${run['total_cost_usd']:.2f}"
+    L.append(" " + dim(stats))
+    if run.get("worktree"): L.append(" " + dim(run["worktree"]))
     if run.get("sid"): L.append(" " + dim("session " + run["sid"]))
     if run["running"]:
         L.append(" " + (green("live input open — m sends a real message")
@@ -454,6 +532,17 @@ def detail(run, ev, mtime, scroll, W, H, reply):
         feed += ["", "  " + cyan("── reply ──")]
         for para in reply[1].splitlines():
             feed += ["  " + ln for ln in wrap(para, W - 4)] if para.strip() else [""]
+
+    # A run a few seconds old has almost nothing in the feed. Show what it is
+    # meant to do and what it has touched, rather than a screen of blank rows.
+    if len(feed) < 6:
+        task = brief_task(run.get("brief"))
+        if task:
+            feed = ["  " + cyan("── the task ──")] + \
+                   ["  " + ln for t in task for ln in wrap(t, W - 4)] + [""] + feed
+    if files:
+        feed += ["", "  " + cyan("── files touched ──")]
+        feed += [f"  {dim(code):<4} {name}" for _, code, name in files]
 
     room = H - len(L) - 2
     start = max(0, len(feed) - room - scroll)
@@ -494,24 +583,25 @@ def main():
                 scr.paint(overview(runs, sel, show_all, calibration(),
                                    scr.cols, scr.rows))
             else:
-                run = runs[sel]
+                run = vis[sel]
                 ev, mtime = read_transcript(run["tpath"])
                 scr.paint(detail(run, ev, mtime, scroll, scr.cols, scr.rows, reply))
             k = read_key(1.0)
             if k is None: continue
             if k == "q": break
+            vis = visible_runs(runs, show_all)
             if view == "list":
-                if   k == "down":  sel = min(sel + 1, len(runs) - 1)
+                if   k == "down":  sel = min(sel + 1, max(0, len(vis) - 1))
                 elif k == "up":    sel = max(sel - 1, 0)
-                elif k == "a":     show_all = not show_all
-                elif k in ("enter", "right") and runs:
+                elif k == "a":     show_all = not show_all; sel = 0
+                elif k in ("enter", "right") and vis:
                     view, scroll, reply = "detail", 0, None
             else:
                 if   k in ("left", "esc", "back"): view, scroll, reply = "list", 0, None
                 elif k == "up":    scroll += 3
                 elif k == "down":  scroll = max(0, scroll - 3)
                 elif k == "m":
-                    run = runs[sel]
+                    run = vis[sel]
                     live = run["running"] and run.get("fifo")
                     txt = prompt(scr, "message → " if live else "ask (forked copy) → ")
                     if txt:
