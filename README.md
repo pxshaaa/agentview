@@ -179,6 +179,11 @@ The GIF is a real recording, not a mockup. `demo/demo.tape` drives the actual
 dashboard against a throwaway registry so no real work appears in it.
 
 ```sh
-brew install vhs
-AGENTRUN_DIR=/tmp/demoreg AGENTRUN_NO_ADOPT=1 vhs demo/demo.tape
+brew install vhs gifsicle
+vhs demo/demo.tape
+gifsicle -O3 --lossy=60 --colors 96 demo/agentview.gif -o demo/agentview.gif
 ```
+
+The tape sets `AGENTRUN_DIR` and `AGENTRUN_NO_ADOPT` itself, so it only ever sees
+the sandbox. gifsicle merges the identical frames a redrawing TUI produces, which
+takes it from 1.3 MB to about 670 KB with no visible difference.
