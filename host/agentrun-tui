@@ -71,13 +71,20 @@ _TFCACHE = {}
 def transcript_for(worktree, started, rid=None):
     """Cached: the glob and stat of every session file is pure overhead once the
     match is known, and it ran for all 25 runs on every refresh."""
-    key = (worktree, rid)
+    key, now = (worktree, rid), time.time()
     hit = _TFCACHE.get(key)
-    if hit is not None and (hit is False or hit.exists()):
-        return None if hit is False else hit
+    if hit:
+        ts, val = hit
+        if val is not False and val.exists():
+            return val
+        # A miss must expire. A run opened before its transcript file appeared
+        # was cached as "no transcript" for the life of the process, which left
+        # it showing 0 tool calls and refusing to be messaged.
+        if val is False and now - ts < 10:
+            return None
     val = _transcript_for(worktree, started, rid)
     if len(_TFCACHE) > 128: _TFCACHE.clear()
-    _TFCACHE[key] = val if val else False
+    _TFCACHE[key] = (now, val if val else False)
     return val
 
 def _transcript_for(worktree, started, rid=None):
@@ -577,7 +584,10 @@ def send_live(run, text):
 def send_message(run, text):
     """Resume the agent's own session and ask it something. Fork while it is
     still running, so two processes never share one session."""
-    if not run.get("sid"): return "This run has no session transcript to resume."
+    if not run.get("sid"):
+        return ("No session transcript found for this run yet, so there is "
+                "nothing to resume. Claude writes one shortly after an agent "
+                "starts; try again in a few seconds.")
     cmd = ["claude", "--resume", run["sid"], "-p", text,
            "--permission-mode", "bypassPermissions"]
     if run["running"]: cmd.insert(3, "--fork-session")
