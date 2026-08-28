@@ -64,7 +64,8 @@ In the dashboard:
 | `↑` `↓` | move |
 | `↵` `→` | open a run, see live narration and every tool call |
 | `←` `esc` | back |
-| `m` | message the agent |
+| `m` | ask about this run, answers in seconds |
+| `M` | resume the agent's own session, slow but authoritative |
 | `a` | show finished runs you've already collected |
 | `q` | quit |
 
@@ -101,16 +102,22 @@ resident forever.
 
 ## Talking to agents
 
-Two modes, and the difference matters.
+Three modes, and the difference matters.
 
 **Live.** Agents launched by `mini-run` have the stdin pipe, so `m` sends a real
 message to the running process. It arrives at the agent's next turn boundary. You
 can add a constraint or redirect what it does next. You cannot interrupt work
 already in flight.
 
-**Forked.** For anything else, finished runs or agents launched some other way,
-`m` resumes a fork of the agent's session and asks there. The answer is accurate
-about its work, but nothing you say reaches the original process.
+**Observed.** For anything else, `m` spawns a small read-only agent, hands it the
+same evidence the dashboard shows (recent narration, tool calls, changed files)
+and asks it there. It answers in seconds and never goes near the running agent.
+It knows what the log shows, not what the agent privately intended.
+
+**Resumed.** `M` resumes a fork of the agent's own session instead. More
+authoritative and much slower: replaying a 1 MB transcript at opus/high took over
+nine minutes to answer "hi". Reach for it when the observer says the log does not
+say.
 
 The dashboard tells you which mode you're in before you type.
 
