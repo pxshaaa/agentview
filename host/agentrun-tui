@@ -843,6 +843,20 @@ def detail(run, ev, mtime, scroll, W, H, reply, full=False):
                         if run.get("fifo") and Path(run["fifo"]).exists()
                         else dim("no live channel · m asks a forked copy, the running "
                                  "agent is not disturbed")))
+    # The feed is the point of this screen, so the file list only gets the rows
+    # it can spare. On a short terminal it collapses to a single line.
+    if files:
+        spare = H - len(L) - 12
+        if spare >= 4:
+            shown = files[:min(6, spare)]
+            L.append(" " + cyan("changed so far") + dim("  (newest first)"))
+            for _, code, name in shown:
+                L.append("   " + dim(f"{code:<3}") + name[:W - 8])
+            if len(files) > len(shown):
+                L.append("   " + dim(f"and {len(files) - len(shown)} more"))
+        else:
+            L.append(" " + cyan("changed so far") +
+                     dim(f"  {len(files)} files, newest {files[0][2]}"[:W - 20]))
     L.append(" " + dim("─" * min(W - 2, 74)))
 
     # Digest by default. An agent's final report is markdown, often hundreds of
@@ -876,7 +890,7 @@ def detail(run, ev, mtime, scroll, W, H, reply, full=False):
         if reply.get("pending"):
             convo.append(" " + dim("agent \u2039 waiting, this can take a minute"))
         else:
-            for para in (reply.get("a") or "(no reply)").splitlines():
+            for para in strip_md(reply.get("a") or "(no reply)"):
                 reply_lines += wrap(para, W - 10) if para.strip() else [""]
             reply_room = max(3, min(len(reply_lines), (H - len(L)) // 2))
             off = max(0, min(reply.get("scroll", 0), len(reply_lines) - reply_room))
@@ -899,10 +913,6 @@ def detail(run, ev, mtime, scroll, W, H, reply, full=False):
         if task:
             feed = ["  " + cyan("── the task ──")] + \
                    ["  " + ln for t in task for ln in wrap(t, W - 4)] + [""] + feed
-    if files:
-        feed += ["", "  " + cyan("── files touched ──")]
-        feed += [f"  {dim(code):<4} {name}" for _, code, name in files]
-
     room = H - len(L) - 2 - len(convo)
     start = max(0, len(feed) - room - scroll)
     L += feed[start:start + room] if room > 0 else []
