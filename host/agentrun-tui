@@ -490,21 +490,40 @@ def calibration():
 class Screen:
     def __init__(self):
         self.rows, self.cols = 24, 80
+        self._prev, self._dirty = None, True
         self.measure()
     def measure(self):
         try:
             sz = os.get_terminal_size()
+            if (sz.lines, sz.columns) != (self.rows, self.cols):
+                self._dirty = True          # a resize invalidates the whole frame
             self.rows, self.cols = sz.lines, sz.columns
         except OSError:
             pass
     def enter(self):
+        self._prev, self._dirty = None, True
         sys.stdout.write(f"{E}?1049h{E}?25l"); sys.stdout.flush()
     def leave(self):
         sys.stdout.write(f"{E}?25h{E}?1049l"); sys.stdout.flush()
     def paint(self, lines):
+        """Write only the rows that changed. Repainting the whole screen on every
+        keypress is what made scrolling feel heavy over ssh."""
         self.measure()
-        body = "\r\n".join(l + f"{E}K" for l in lines[: self.rows])
-        sys.stdout.write(f"{E}H" + body + f"{E}J"); sys.stdout.flush()
+        lines = list(lines[: self.rows])
+        if self._prev is None or len(self._prev) != len(lines) or self._dirty:
+            body = "\r\n".join(l + f"{E}K" for l in lines)
+            sys.stdout.write(f"{E}H" + body + f"{E}J")
+            self._dirty = False
+        else:
+            out = []
+            for i, (old, new) in enumerate(zip(self._prev, lines)):
+                if old != new:
+                    out.append(f"{E}{i + 1};1H{new}{E}K")
+            if not out:
+                return
+            sys.stdout.write("".join(out))
+        self._prev = lines
+        sys.stdout.flush()
 
 def wrap(text, width):
     out, cur = [], ""
@@ -556,6 +575,9 @@ def prompt(scr, label):
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         tty.setraw(fd)
         sys.stdout.write(f"{E}?25l"); sys.stdout.flush()
+    # The prompt wrote to the bottom row behind paint's back, so its idea of the
+    # screen is now wrong. Force one full repaint or the prompt text lingers.
+    scr._dirty = True
     return line.strip()
 
 def send_live(run, text):
@@ -898,49 +920,58 @@ def main():
                 scr.paint(detail(run, ev, mtime, scroll, scr.cols, scr.rows, reply, full))
             k = read_key(1.0)
             if k is None: continue
-            if k == "q": break
-            vis = visible_runs(runs, show_all)
-            if view == "list":
-                if   k == "down":  sel = min(sel + 1, max(0, len(vis) - 1))
-                elif k == "up":    sel = max(sel - 1, 0)
-                elif k == "a":     show_all = not show_all; sel = 0
-                elif k in ("enter", "right") and vis:
-                    view, scroll, reply = "detail", 0, None
-            else:
-                if   k in ("left", "back"): view, scroll, reply = "list", 0, None
-                elif k == "esc":
-                    if reply: reply = None      # close the answer, keep the run open
-                    else:     view, scroll = "list", 0
-                elif k == "up":
-                    if reply and not reply.get("pending"):
-                        reply["scroll"] = reply.get("scroll", 0) + 3
-                    else: scroll += 3
-                elif k == "down":
-                    if reply and not reply.get("pending"):
-                        reply["scroll"] = max(0, reply.get("scroll", 0) - 3)
-                    else: scroll = max(0, scroll - 3)
-                elif k == "f":
-                    full = not full; scroll = 0
-                elif k in ("m", "M"):
-                    run = vis[min(sel, len(vis) - 1)] if vis else None
-                    live = bool(run and run["running"] and run.get("fifo"))
-                    deep = (k == "M")
-                    label = ("side note \u203a " if live
-                             else ("resume the session, slow \u203a " if deep
-                                   else "ask about this run \u203a "))
-                    txt = prompt(scr, label)
-                    if txt and run:
-                        reply = {"q": txt, "a": None, "pending": True}
-                        # Answering can take a minute. Do it off the draw loop so
-                        # the feed keeps updating instead of the screen freezing.
-                        def _ask(box=reply, r=run, t=txt, was_live=live, deep=deep):
-                            out = send_live(r, t) if was_live else None
-                            if out is None:
-                                out = send_message(r, t) if deep else observe(r, t)
-                            box["a"] = out
-                            box["pending"] = False
-                        threading.Thread(target=_ask, daemon=True).start()
-                        scroll = 0
+            # Drain whatever else is queued and apply it all before repainting.
+            # Holding an arrow key produced one full repaint per keypress, so the
+            # loop fell behind the input and the screen kept catching up.
+            keys = [k]
+            while len(keys) < 64:
+                nk = read_key(0.0)
+                if nk is None: break
+                keys.append(nk)
+            if "q" in keys: break
+            for k in keys:
+                vis = visible_runs(runs, show_all)
+                if view == "list":
+                    if   k == "down":  sel = min(sel + 1, max(0, len(vis) - 1))
+                    elif k == "up":    sel = max(sel - 1, 0)
+                    elif k == "a":     show_all = not show_all; sel = 0
+                    elif k in ("enter", "right") and vis:
+                        view, scroll, reply = "detail", 0, None
+                else:
+                    if   k in ("left", "back"): view, scroll, reply = "list", 0, None
+                    elif k == "esc":
+                        if reply: reply = None      # close the answer, keep the run open
+                        else:     view, scroll = "list", 0
+                    elif k == "up":
+                        if reply and not reply.get("pending"):
+                            reply["scroll"] = reply.get("scroll", 0) + 3
+                        else: scroll += 3
+                    elif k == "down":
+                        if reply and not reply.get("pending"):
+                            reply["scroll"] = max(0, reply.get("scroll", 0) - 3)
+                        else: scroll = max(0, scroll - 3)
+                    elif k == "f":
+                        full = not full; scroll = 0
+                    elif k in ("m", "M"):
+                        run = vis[min(sel, len(vis) - 1)] if vis else None
+                        live = bool(run and run["running"] and run.get("fifo"))
+                        deep = (k == "M")
+                        label = ("side note \u203a " if live
+                                 else ("resume the session, slow \u203a " if deep
+                                       else "ask about this run \u203a "))
+                        txt = prompt(scr, label)
+                        if txt and run:
+                            reply = {"q": txt, "a": None, "pending": True}
+                            # Answering can take a minute. Do it off the draw loop so
+                            # the feed keeps updating instead of the screen freezing.
+                            def _ask(box=reply, r=run, t=txt, was_live=live, deep=deep):
+                                out = send_live(r, t) if was_live else None
+                                if out is None:
+                                    out = send_message(r, t) if deep else observe(r, t)
+                                box["a"] = out
+                                box["pending"] = False
+                            threading.Thread(target=_ask, daemon=True).start()
+                            scroll = 0
     except KeyboardInterrupt:
         pass
     finally:
