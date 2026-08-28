@@ -562,23 +562,70 @@ def read_key(timeout):
     return {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}.get(rest[1:2], "esc")
 
 def prompt(scr, label):
-    """Cooked-mode single-line input, drawn on the bottom row."""
-    sys.stdout.write(f"{E}{scr.rows};1H{E}K{E}?25h" + bold(label)); sys.stdout.flush()
+    """Inline single-line editor, in raw mode.
+
+    The old version dropped to cooked mode and used readline, which meant esc did
+    nothing and ctrl-c killed the whole interface instead of cancelling the edit.
+    Returns None when cancelled, so an empty submit and a cancel stay distinct.
+    """
     fd = sys.stdin.fileno()
-    saved = termios.tcgetattr(fd)
-    try:
-        termios.tcsetattr(fd, termios.TCSADRAIN, ORIGINAL)
-        line = sys.stdin.readline()
-    except Exception:
-        line = ""
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        tty.setraw(fd)
-        sys.stdout.write(f"{E}?25l"); sys.stdout.flush()
-    # The prompt wrote to the bottom row behind paint's back, so its idea of the
-    # screen is now wrong. Force one full repaint or the prompt text lingers.
+    buf, cur = "", 0
+    hint = dim("   esc cancel · ↵ send")
+    while True:
+        row = scr.rows
+        shown = buf
+        room = max(10, scr.cols - visible_len(label) - visible_len(hint) - 2)
+        off = 0
+        if len(shown) > room:                       # keep the caret in view
+            off = max(0, cur - room + 1)
+            shown = shown[off:off + room]
+        sys.stdout.write(f"{E}{row};1H{E}K" + cyan(label) + shown + hint)
+        sys.stdout.write(f"{E}{row};{visible_len(label) + (cur - off) + 1}H{E}?25h")
+        sys.stdout.flush()
+        try:
+            ch = os.read(fd, 1)
+        except OSError:
+            ch = b""
+        if not ch:
+            buf = None; break
+        if ch in (b"\r", b"\n"):
+            break
+        if ch == b"\x03":                            # ctrl-c cancels the edit only
+            buf = None; break
+        if ch == b"\x1b":
+            if not select.select([fd], [], [], 0.06)[0]:
+                buf = None; break                   # bare esc cancels
+            seq = os.read(fd, 8)
+            if seq[:1] == b"[":
+                c = seq[1:2]
+                if   c == b"D": cur = max(0, cur - 1)
+                elif c == b"C": cur = min(len(buf), cur + 1)
+                elif c == b"H": cur = 0
+                elif c == b"F": cur = len(buf)
+            continue
+        if ch in (b"\x7f", b"\x08"):                 # backspace
+            if cur: buf, cur = buf[:cur - 1] + buf[cur:], cur - 1
+            continue
+        if ch == b"\x15":                            # ctrl-u clears the line
+            buf, cur = "", 0
+            continue
+        if ch == b"\x17":                            # ctrl-w deletes a word
+            left = buf[:cur].rstrip()
+            cut = left.rfind(" ") + 1
+            buf, cur = buf[:cut] + buf[cur:], cut
+            continue
+        if ch == b"\x01": cur = 0; continue          # ctrl-a
+        if ch == b"\x05": cur = len(buf); continue    # ctrl-e
+        try: s = ch.decode("utf-8")
+        except UnicodeDecodeError:
+            extra = os.read(fd, 3)
+            try: s = (ch + extra).decode("utf-8", "ignore")
+            except Exception: continue
+        if s and s.isprintable():
+            buf, cur = buf[:cur] + s + buf[cur:], cur + len(s)
+    sys.stdout.write(f"{E}?25l"); sys.stdout.flush()
     scr._dirty = True
-    return line.strip()
+    return buf
 
 def send_live(run, text):
     """Queue a message straight into a running agent's stdin. It arrives at the
