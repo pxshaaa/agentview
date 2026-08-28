@@ -581,6 +581,55 @@ def send_live(run, text):
     except Exception as e:
         return f"(could not reach the live agent: {e})"
 
+def observe(run, question):
+    """Answer about a run without resuming its session.
+
+    Resuming replays the agent's whole conversation. On a 1.1 MB transcript at
+    opus/high, answering "hi" took over nine minutes. This instead hands a small
+    read-only agent the same evidence the dashboard shows and asks it there:
+    seconds instead of minutes, no tools, and the working agent is untouched.
+    """
+    ev, mtime = read_transcript(run.get("tpath"), 300_000)
+    lines = []
+    for kind, val, _ in ev[-90:]:
+        if kind == "say":
+            lines.append("said: " + " ".join(str(val).split())[:400])
+        else:
+            lines.append("did: " + (val[2] if len(val) > 2 else val[1]))
+    files = wt_files(run.get("worktree"), 40)
+    now = time.time()
+    ctx = "\n".join([
+        "You are looking at a log of a coding agent that is working right now.",
+        "Answer the question from this evidence only. Be brief and concrete.",
+        "Do not use any tools. If the log does not say, say so plainly.",
+        "",
+        "Task it was given: " + str(run.get("title", "(unknown)")),
+        "State: " + ("running" if run.get("running") else "finished")
+        + ", started " + hms(now - run.get("started", now)) + " ago"
+        + ", last activity " + (hms(now - mtime) if mtime else "unknown") + " ago",
+        "Working directory: " + str(run.get("worktree", "(none)")),
+        "",
+        "Files it has changed so far:",
+        *([f"  {c} {n}" for _, c, n in files] or ["  (none yet)"]),
+        "",
+        "Most recent activity, oldest first:",
+        *([f"  {l}" for l in lines] or ["  (nothing recorded yet)"]),
+        "",
+        "Question: " + question,
+    ])
+    cmd = ["claude", "-p", ctx, "--model", "sonnet", "--effort", "low",
+           "--disallowedTools", "Bash", "Edit", "Write", "Read", "Task",
+           "--permission-mode", "bypassPermissions"]
+    try:
+        # cwd is /tmp, not the worktree: nothing it could damage even if it tried
+        r = subprocess.run(cmd, cwd="/tmp", input="", capture_output=True,
+                           text=True, timeout=240)
+        return (r.stdout or r.stderr or "").strip() or "(no answer)"
+    except subprocess.TimeoutExpired:
+        return "(timed out after 4 minutes)"
+    except Exception as e:
+        return "(failed: %s)" % e
+
 def send_message(run, text):
     """Resume the agent's own session and ask it something. Fork while it is
     still running, so two processes never share one session."""
@@ -794,7 +843,7 @@ def detail(run, ev, mtime, scroll, W, H, reply, full=False):
         tail = "  ↑↓ scroll answer · esc close · ← back · m message · q quit"
     else:
         tail = ("  ↑↓ scroll · f " + ("digest" if full else "full text")
-                + " · ← back · m message · q quit")
+                + " · m ask · M resume · ← back · q quit")
     if scroll: tail += f"   (scrolled back {scroll})"
     L.append(dim(tail))
     return L
@@ -872,18 +921,23 @@ def main():
                     else: scroll = max(0, scroll - 3)
                 elif k == "f":
                     full = not full; scroll = 0
-                elif k == "m":
+                elif k in ("m", "M"):
                     run = vis[min(sel, len(vis) - 1)] if vis else None
                     live = bool(run and run["running"] and run.get("fifo"))
-                    txt = prompt(scr, "side note \u203a " if live
-                                 else "ask a copy \u203a ")
+                    deep = (k == "M")
+                    label = ("side note \u203a " if live
+                             else ("resume the session, slow \u203a " if deep
+                                   else "ask about this run \u203a "))
+                    txt = prompt(scr, label)
                     if txt and run:
                         reply = {"q": txt, "a": None, "pending": True}
                         # Answering can take a minute. Do it off the draw loop so
                         # the feed keeps updating instead of the screen freezing.
-                        def _ask(box=reply, r=run, t=txt, was_live=live):
+                        def _ask(box=reply, r=run, t=txt, was_live=live, deep=deep):
                             out = send_live(r, t) if was_live else None
-                            box["a"] = out if out is not None else send_message(r, t)
+                            if out is None:
+                                out = send_message(r, t) if deep else observe(r, t)
+                            box["a"] = out
                             box["pending"] = False
                         threading.Thread(target=_ask, daemon=True).start()
                         scroll = 0
