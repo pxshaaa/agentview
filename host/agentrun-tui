@@ -25,6 +25,7 @@ bold   = lambda s: sgr(s, "1")
 green  = lambda s: sgr(s, "32")
 yellow = lambda s: sgr(s, "33")
 cyan   = lambda s: sgr(s, "36")
+red    = lambda s: sgr(s, "31")
 inv    = lambda s: sgr(s, "7")
 
 def hms(sec):
@@ -252,6 +253,17 @@ PHASE = {"Read": "reading", "Grep": "searching", "Glob": "searching",
 # ------------------------------------------------------------------ state ---
 TASK_RE = re.compile(r"^===\s*(?:YOUR TASK|TASK)\s*[—:-]*\s*(.*?)\s*===\s*$", re.M)
 
+def brief_title(path):
+    if not path: return ""
+    try: txt = Path(path).read_text("utf-8", "replace")
+    except Exception: return ""
+    m = TASK_RE.search(txt)
+    if m and m.group(1): return m.group(1)
+    for ln in (l.strip() for l in txt.splitlines()):
+        if len(ln) > 40 and not ln.startswith(("=", "-", "#", "NEVER", "Do not")):
+            return ln[:120]
+    return ""
+
 def adopt(pid, rid, args):
     reg = REG / f"{rid}.json"
     if reg.exists(): return
@@ -378,6 +390,45 @@ def _wt_dirty(worktree):
     except Exception:
         return "gone"
 
+FD_HINT = ("looks like the file-descriptor limit: claude dies instantly with "
+           "this message when the soft limit is 256. Launch with "
+           "`ulimit -n 65536` before it.")
+
+def dead_runs(known, max_age=86400):
+    """A run that dies in its first second leaves a brief and a tiny log and no
+    process, so nothing else here would ever mention it. Silence is the worst
+    possible report for a failed launch, so surface it."""
+    out, now = [], time.time()
+    for brief in Path("/tmp").glob("*.brief"):
+        rid = brief.stem
+        if rid in known: continue
+        try:
+            if now - brief.stat().st_mtime > max_age: continue
+        except OSError:
+            continue
+        log = Path(f"/tmp/{rid}.log")
+        if not log.exists(): continue
+        try:
+            if log.stat().st_size > 2000: continue      # a real report, not a crash
+            txt = log.read_text("utf-8", "replace").strip()
+        except OSError:
+            continue
+        if not txt: continue
+        # A crash is claude's own `error: ...` on the first line. Matching any
+        # log containing the word "error" flagged successful short reports.
+        first = next((l for l in txt.splitlines() if l.strip()), "")
+        crashed = (re.match(r"^\s*(error|fatal)\b", first, re.I)
+                   or (len(txt) < 200 and "error" in txt.lower()))
+        if not crashed: continue
+        out.append({
+            "id": rid, "title": "", "worktree": "", "wt_name": "", "branch": "",
+            "model": "", "effort": "", "pid": None,
+            "started": brief.stat().st_mtime, "brief": str(brief),
+            "failed": first.strip()[:160],
+            "hint": FD_HINT if "unknown error" in txt.lower() else "",
+        })
+    return out
+
 def collect():
     ps = ps_snapshot()
     known = {f.stem for f in REG.glob("*.json") if f.name != "calibration.json"}
@@ -403,6 +454,11 @@ def collect():
         r["dirty"]   = wt_dirty(r.get("worktree"))
         if r.get("fifo") and not Path(r["fifo"]).exists(): r["fifo"] = None
         runs.append(r)
+    for d in dead_runs({r["id"] for r in runs}):
+        d["running"], d["tpath"], d["sid"] = False, None, None
+        d["dirty"], d["shared_with"] = None, None
+        d["title"] = d["title"] or brief_title(d["brief"]) or "(launch failed)"
+        runs.append(d)
     runs.sort(key=lambda r: (0 if r["running"] else 1, -r.get("started", 0)))
     # Several runs often reuse one worktree. Its uncommitted files belong to
     # whichever touched it last; repeating them under three runs reads as 30.
@@ -535,35 +591,39 @@ def send_message(run, text):
         return f"(failed: {e})"
 
 # ------------------------------------------------------------------ views ---
+def is_idle(r):
+    """Finished, nothing uncommitted, nothing to explain. Failed launches are
+    never idle: a run that died silently is the whole point of this view."""
+    if r.get("failed"): return False
+    return (not r["running"] and not r.get("shared_with")
+            and (r["dirty"] in (0, None) or r["dirty"] == "gone"))
+
 def visible_runs(runs, show_all):
     """Rows actually on screen. The selection indexes these, not every run:
     with finished runs hidden, indexing the full list opens the wrong one."""
     if show_all: return list(runs)
-    out = []
-    for r in runs:
-        idle = (not r["running"] and not r.get("shared_with")
-                and (r["dirty"] in (0, None) or r["dirty"] == "gone"))
-        if not idle: out.append(r)
-    return out
+    return [r for r in runs if not is_idle(r)]
 
 def overview(runs, sel, show_all, cal, W, H=0):
     live = sum(1 for r in runs if r["running"])
     rev  = sum(1 for r in runs if not r["running"]
                and isinstance(r["dirty"], int) and r["dirty"])
     gone = sum(1 for r in runs if r["running"] and r["dirty"] == "gone")
+    failed = sum(1 for r in runs if r.get("failed"))
     head = f"AGENTS · {live} running · {rev} needs review"
+    if failed: head += f" · {failed} FAILED TO START"
     if gone: head += f" · {gone} WORKTREE GONE MID-RUN"
     L = ["", " " + bold(head), " " + dim("─" * min(W - 2, 74))]
     now, hidden, vi = time.time(), 0, -1
     for r in runs:
-        idle = (not r["running"] and not r.get("shared_with")
-                and (r["dirty"] in (0, None) or r["dirty"] == "gone"))
+        idle = is_idle(r)
         if idle and not show_all:
             hidden += 1; continue
         ev, mtime = (read_transcript(r["tpath"], 60_000) if r["running"]
                      else ([], r["tpath"].stat().st_mtime if r["tpath"] else None))
         stalled = r["running"] and mtime and (now - mtime) > STALL
-        if stalled:        mark, tone = "⚠", yellow
+        if r.get("failed"): mark, tone = "✗", red
+        elif stalled:      mark, tone = "⚠", yellow
         elif r["running"]: mark, tone = "●", green
         elif isinstance(r["dirty"], int) and r["dirty"]: mark, tone = "✓", cyan
         else:              mark, tone = "✓", dim
@@ -606,6 +666,11 @@ def overview(runs, sel, show_all, cal, W, H=0):
             elif cal and cal.get("median_min") and (now - r.get("started", now)) > 120:
                 L.append(g + "  " + dim(f"typical {cal['p25_min']}–{cal['p75_min']}m "
                                           f"across {cal['n']} past runs"))
+        elif r.get("failed"):
+            L.append(g + "  " + red("died at launch: " + r["failed"]))
+            if r.get("hint"):
+                for ln in wrap(r["hint"], W - 8)[:2]:
+                    L.append(g + "  " + dim(ln))
         else:
             if r["dirty"] == "gone":
                 L.append(g + "  " + dim("worktree removed, cannot verify what was harvested"))
