@@ -889,8 +889,10 @@ def overview(runs, sel, show_all, cal, W, H=0):
         if picked:
             L.append(inv(head_txt[:W].ljust(min(W, 76))))
         else:
-            L.append(f" {tone(mark)} {bold(r['id']):<9}{dim(state)}"
-                     + (f"   {dim(where)}" if where else ""))
+            # pad the plain id, then colour it: padding a coloured string
+            # counts the escape codes and collapses the gap
+            L.append(f" {tone(mark)} " + bold(r["id"]) + " " * max(1, 9 - len(r["id"]))
+                     + dim(state) + (f"   {dim(where)}" if where else ""))
         # a gutter marks which block belongs to the selected row
         g = cyan("\u2502") + " " if picked else "  "
         for i, ln in enumerate(wrap(r.get("title", ""), W - 8)[:2]):
