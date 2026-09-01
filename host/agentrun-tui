@@ -250,7 +250,15 @@ def describe(name, inp):
     if low.startswith("docker"):                    return "ran a container"
     if low.startswith(("mkdir", "cp ", "mv ")):     return "moved files around"
     if low.startswith(("echo", "printf")):          return "wrote some text"
-    return "ran " + _base((c.split() or ["?"])[0])
+    words = c.split() or ["?"]
+    # for/while/until/if wrap the real command; name that instead of the keyword
+    if words[0] in ("for", "while", "until", "if", "do", "then", "(", "{"):
+        for w in words[1:]:
+            if w in ("in", "do", ";", "then", "[", "[["): continue
+            if w.isidentifier() or "/" in w:
+                return "ran a loop over " + _base(w)
+        return "ran a shell loop"
+    return "ran " + _base(words[0])
 
 PHASE = {"Read": "reading", "Grep": "searching", "Glob": "searching",
          "Edit": "editing", "Write": "writing", "NotebookEdit": "editing",
@@ -260,16 +268,55 @@ PHASE = {"Read": "reading", "Grep": "searching", "Glob": "searching",
 # ------------------------------------------------------------------ state ---
 TASK_RE = re.compile(r"^===\s*(?:YOUR TASK|TASK)\s*[—:-]*\s*(.*?)\s*===\s*$", re.M)
 
+def title_from_transcript(tpath):
+    """The opening prompt is the brief. When /tmp has been cleaned there is no
+    other source, and a run with no title is useless in a list."""
+    if not tpath or not Path(tpath).exists(): return ""
+    try:
+        with Path(tpath).open("r", errors="replace") as f:
+            for _ in range(400):
+                line = f.readline()
+                if not line: break
+                if '"type": "user"' not in line and '"type":"user"' not in line:
+                    continue
+                try: d = json.loads(line)
+                except Exception: continue
+                c = d.get("message", {}).get("content")
+                txt = c if isinstance(c, str) else " ".join(
+                    b.get("text", "") for b in (c or []) if isinstance(b, dict))
+                if not txt.strip(): continue
+                m = TASK_RE.search(txt)
+                if m and m.group(1): return m.group(1)
+                return first_task_line(txt)
+    except Exception:
+        pass
+    return ""
+
+def first_task_line(txt):
+    """The first line that reads like a task. Skips rule preambles and bare
+    paths, which is what a naive "first long line" kept picking up."""
+    m = TASK_RE.search(txt)
+    if m and m.group(1): return m.group(1)
+    for raw in txt.splitlines():
+        ln = raw.strip().strip("`")
+        if len(ln) < 25 or len(ln) > 160: continue
+        if ln.startswith(("=", "-", "*", "#", ">", "|", "NEVER", "Do not", "DO NOT")):
+            continue
+        if ln.count("/") >= 2 or ln.startswith("/"):       # a path, not a task
+            continue
+        low = ln.lower()
+        if any(w in low for w in ("worktree", "isolation", "forbidden",
+                                  "read first", "absolute", "arbeitest im")):
+            continue
+        ln = ln.replace("**", "").replace("__", "").replace("`", "")
+        return " ".join(ln.split())[:120]
+    return ""
+
 def brief_title(path):
     if not path: return ""
     try: txt = Path(path).read_text("utf-8", "replace")
     except Exception: return ""
-    m = TASK_RE.search(txt)
-    if m and m.group(1): return m.group(1)
-    for ln in (l.strip() for l in txt.splitlines()):
-        if len(ln) > 40 and not ln.startswith(("=", "-", "#", "NEVER", "Do not")):
-            return ln[:120]
-    return ""
+    return first_task_line(txt)
 
 def adopt(pid, rid, args):
     reg = REG / f"{rid}.json"
@@ -307,6 +354,22 @@ def adopt(pid, rid, args):
             "started": brief.stat().st_mtime if brief.exists() else time.time(),
             "brief": str(brief), "adopted": True}, indent=2))
     except Exception: pass
+
+def last_words(ev, n=1):
+    """The agent's most recent narration, unflattened so markdown survives."""
+    said = [v for k, v, _ in ev if k == "say" and str(v).strip()]
+    return said[-n] if said else None
+
+def outcome_for(rid, ev):
+    """One line on how a finished run ended. Prefer its SUMMARY, fall back to the
+    last thing it said, because runs launched without mini-run write no SUMMARY
+    and were showing nothing at all."""
+    sm = summary_for(rid)
+    if sm: return sm, True
+    said = last_words(ev)
+    if not said: return (None, False)
+    clean = [l for l in strip_md(said) if l.strip() and not l.startswith(("(table)", "(code)"))]
+    return ((" ".join(clean[0].split()) if clean else None), False)
 
 def summary_for(rid):
     """The SUMMARY: line an agent ends its report with. Read from the small
@@ -436,6 +499,34 @@ def dead_runs(known, max_age=86400):
         })
     return out
 
+def proc_age(pid):
+    """Seconds the process has been alive, from ps. Defaulting a missing start
+    time to now made every repaired run read as "0s"."""
+    try:
+        out = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return 0
+    if not out: return 0
+    days, _, rest = out.partition("-")
+    if not rest: days, rest = "0", out
+    parts = [int(x) for x in rest.split(":") if x.strip().isdigit()]
+    while len(parts) < 3: parts.insert(0, 0)
+    h, m, sec = parts[-3:]
+    return int(days) * 86400 + h * 3600 + m * 60 + sec
+
+def cwd_of(pid):
+    """Where a live process is working. Lets a run with broken metadata repair
+    itself instead of showing up as an anonymous row."""
+    try:
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True, timeout=10).stdout
+        for l in out.splitlines():
+            if l.startswith("n"): return l[1:]
+    except Exception:
+        pass
+    return ""
+
 def collect():
     ps = ps_snapshot()
     known = {f.stem for f in REG.glob("*.json") if f.name != "calibration.json"}
@@ -450,6 +541,16 @@ def collect():
         try: r = json.loads(f.read_text())
         except Exception: continue
         r["running"] = alive(r.get("pid"), r["id"], ps)
+        # A stub entry (metadata write failed) can still be repaired from the
+        # live process: its cwd gives the worktree, which gives the transcript.
+        if r["running"] and not r.get("worktree") and r.get("claude_pid"):
+            wt = cwd_of(r["claude_pid"]) or cwd_of(r.get("pid"))
+            if wt:
+                r["worktree"], r["wt_name"] = wt, Path(wt).name
+        if not r.get("started"):
+            age = proc_age(r.get("claude_pid") or r.get("pid"))
+            r["started"] = time.time() - age if age else (
+                r["tpath"].stat().st_ctime if r.get("tpath") else time.time())
         r["tpath"]   = transcript_for(r.get("worktree"), r.get("started"), r["id"])
         # our own stream is named for the run, not the session; find the id inside
         r["sid"]     = (r["tpath"].stem if r["tpath"] and r["tpath"].parent == PROJ.joinpath(r["tpath"].parent.name)
@@ -459,6 +560,14 @@ def collect():
         elif r["tpath"]:
             r["sid"] = r["tpath"].stem
         r["dirty"]   = wt_dirty(r.get("worktree"))
+        if not r.get("title"):
+            guess = (brief_title(r.get("brief") or f"/tmp/{r['id']}.brief")
+                     or title_from_transcript(r.get("tpath"))
+                     or title_from_transcript(
+                         _transcript_for(r.get("worktree"), r.get("started"))))
+            # Say when a title was inferred from the prompt rather than given.
+            r["title"] = guess or "(no title recorded)"
+            r["title_guessed"] = bool(guess)
         if r.get("fifo") and not Path(r["fifo"]).exists(): r["fifo"] = None
         runs.append(r)
     for d in dead_runs({r["id"] for r in runs}):
@@ -747,7 +856,8 @@ def overview(runs, sel, show_all, cal, W, H=0):
         idle = is_idle(r)
         if idle and not show_all:
             hidden += 1; continue
-        ev, mtime = (read_transcript(r["tpath"], 60_000) if r["running"]
+        ev, mtime = (read_transcript(r["tpath"], 60_000)
+                     if (r["running"] or not summary_for(r["id"]))
                      else ([], r["tpath"].stat().st_mtime if r["tpath"] else None))
         stalled = r["running"] and mtime and (now - mtime) > STALL
         if r.get("failed"): mark, tone = "✗", red
@@ -755,45 +865,60 @@ def overview(runs, sel, show_all, cal, W, H=0):
         elif r["running"]: mark, tone = "●", green
         elif isinstance(r["dirty"], int) and r["dirty"]: mark, tone = "✓", cyan
         else:              mark, tone = "✓", dim
-        meta  = "/".join(v for v in (r.get("model"), r.get("effort")) if v)
-        where = r.get("wt_name") or "?"
+        # Elapsed-since-start read as a duration on finished runs, so a job that
+        # took 90 minutes yesterday showed "19h27". Say what each number means.
+        started = r.get("started") or 0
+        if r["running"]:
+            state = "running " + hms(now - started) if started else "running"
+        elif r.get("failed"):
+            state = "failed at launch"
+        else:
+            dur = (r.get("duration_ms") or 0) / 1000
+            ago = hms(now - (r.get("ended") or started)) if (r.get("ended") or started) else "?"
+            state = (f"took {hms(dur)}, done {ago} ago" if dur
+                     else f"done {ago} ago")
+        where = r.get("wt_name") or ""
         if r.get("branch") and r["branch"] != r.get("wt_name"):
             where += " → " + r["branch"]
         vi += 1                       # index among visible rows only
         picked = (vi == sel)
         # A selected row is drawn as plain text then inverted whole. Colour codes
         # inside it reset the inversion partway, which is why it looked unselected.
+        head_txt = f" {mark} {r['id']:<9}{state}"
+        if where: head_txt += f"   {where}"
         if picked:
-            plain = (f" {mark} {r['id']:<12}"
-                     f"{hms(now - r.get('started', now)):>6} · {meta:<12} {where}")
-            L.append(inv(plain[:W].ljust(min(W, 78))))
+            L.append(inv(head_txt[:W].ljust(min(W, 76))))
         else:
-            L.append(f" {tone(mark)} {bold(r['id']):<12}"
-                     f"{hms(now - r.get('started', now)):>6} · {meta:<12} {dim(where)}")
+            L.append(f" {tone(mark)} {bold(r['id']):<9}{dim(state)}"
+                     + (f"   {dim(where)}" if where else ""))
         # a gutter marks which block belongs to the selected row
         g = cyan("\u2502") + " " if picked else "  "
-        for ln in wrap(r.get("title", ""), W - 8)[:2]:
-            L.append(g + " " + ln)
+        for i, ln in enumerate(wrap(r.get("title", ""), W - 8)[:2]):
+            L.append(g + " " + ln + (dim("  (inferred)")
+                                     if i == 0 and r.get("title_guessed") else ""))
         if r["running"]:
             say  = next((v for k, v, _ in reversed(ev) if k == "say"), None)
             if say: say = " ".join(str(say).split())
             tool = next((v for k, v, _ in reversed(ev) if k == "tool"), None)
+            age = hms(now - mtime) if mtime else "?"
+            # Lead with what it said. "ran a script" alone tells you nothing.
+            if say:
+                for i, ln in enumerate(wrap(say[:220], W - 12)[:2]):
+                    L.append(g + ("  › " if i == 0 else "    ") + ln)
             if tool:
-                ph  = PHASE.get(tool[0], tool[0])
-                age = hms(now - mtime) if mtime else "?"
-                room = max(20, W - 22)
                 what = tool[2] if len(tool) > 2 else tool[1]
-                left = f"   ▸ {what}"
+                room = max(20, W - 22)
+                left = f"    now {what}"
                 if len(left) > room: left = left[: room - 1] + "…"
                 L.append(g + f"{left:<{room}}  " + dim(f"{age} ago"))
-            if say:
-                for ln in wrap("“" + say[:200] + "”", W - 12)[:2]:
-                    L.append(g + "    " + dim(ln))
+            elif not say:
+                L.append(g + "  " + dim("just started, nothing recorded yet"))
             if stalled:
                 L.append(g + "  " + yellow(f"no events for {hms(now - mtime)}, may be hung"))
-            elif cal and cal.get("median_min") and (now - r.get("started", now)) > 120:
-                L.append(g + "  " + dim(f"typical {cal['p25_min']}–{cal['p75_min']}m "
-                                          f"across {cal['n']} past runs"))
+            elif (cal and cal.get("p75_min")
+                  and (now - r.get("started", now)) > cal["p75_min"] * 60):
+                L.append(g + "  " + dim(f"running longer than usual "
+                                        f"(most finish inside {cal['p75_min']}m)"))
         elif r.get("failed"):
             L.append(g + "  " + red("died at launch: " + r["failed"]))
             if r.get("hint"):
@@ -803,15 +928,19 @@ def overview(runs, sel, show_all, cal, W, H=0):
             if r["dirty"] == "gone":
                 L.append(g + "  " + dim("worktree removed, cannot verify what was harvested"))
             elif r.get("shared_with"):
-                L.append(g + "  " + dim(f"shares worktree with {r['shared_with']}, "
-                                     f"which holds the uncommitted work"))
+                L.append(g + "  " + dim(f"work sits in {r.get('wt_name','?')}, "
+                                        f"held by {r['shared_with']}"))
             elif isinstance(r["dirty"], int) and r["dirty"]:
                 L.append(g + "  " + yellow(f"{r['dirty']} file"
                                         f"{'s' if r['dirty'] != 1 else ''} UNCOMMITTED"))
-            sm = summary_for(r["id"])
+            sm, is_summary = outcome_for(r["id"], ev)
             if sm:
-                for j, ln in enumerate(wrap(sm, W - 14)[:3]):
-                    L.append(g + "  " + (dim("SUMMARY: ") if j == 0 else "         ") + dim(ln))
+                tag = "wrapped up: " if is_summary else "last said: "
+                for j, ln in enumerate(wrap(sm, W - 16)[:3]):
+                    L.append(g + "  " + (dim(tag) if j == 0 else " " * len(tag))
+                             + dim(ln))
+            else:
+                L.append(g + "  " + dim("no report captured"))
         L.append("")
     if hidden and not show_all:
         L.append(" " + dim(f"{hidden} finished and harvested · a to show"))

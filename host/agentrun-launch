@@ -37,7 +37,10 @@ reg = REG / f"{rid}.json"
 try:
     r = json.loads(reg.read_text())
 except Exception:
-    r = {"id": rid}
+    # No metadata means mini-run's write failed. Say so rather than inventing a
+    # run with no title, no worktree and a start time of zero.
+    r = {"id": rid, "title": "(metadata missing, launched without mini-run?)",
+         "worktree": wt, "wt_name": os.path.basename(wt), "started": time.time()}
 r.update({"pid": os.getpid(), "claude_pid": p.pid, "fifo": str(fifo),
           "live_input": True})
 reg.write_text(json.dumps(r, indent=2))
